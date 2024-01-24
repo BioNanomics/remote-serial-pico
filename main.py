@@ -25,11 +25,13 @@ wlan.active(True)
 wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
 while not wlan.isconnected():
+    blink_led()
     time.sleep(1)
 
+led.on()
 print("Connected to WiFi")
 
-# Function to establish a new TCP connection
+# Establish a new TCP connection
 def create_tcp_connection():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((TCP_IP, TCP_PORT))
