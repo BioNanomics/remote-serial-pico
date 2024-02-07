@@ -4,15 +4,15 @@ import time
 from machine import UART, Pin
 
 # Network credentials
-WIFI_SSID = 'your_wifi_ssid'
-WIFI_PASSWORD = 'your_wifi_password'
+WIFI_SSID = 'mieweb-corp'
+WIFI_PASSWORD = 'REDACTED_WIFI_PASSWORD'
 
 # Server details
-TCP_IP = 'your_device_ip_address'
-TCP_PORT = 50000 
+IP_ADDRESS = '10.3.136.129'
+TCP_PORT = 50000
 
 # Initialize UART and LED
-uart1 = UART(1, 19200)
+uart1 = UART(1, 19200)  # Adjust UART settings as per your configuration
 uart1.init(19200, bits=8, parity=None, stop=1, tx=4, rx=5)
 led = Pin("LED", Pin.OUT)
 
@@ -26,20 +26,37 @@ wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
 while not wlan.isconnected():
     blink_led()
-    time.sleep(1)
+    time.sleep(0.1)
 
-led.on()
+led.off()
 print("Connected to WiFi")
 
-# Establish a new TCP connection
+# Establish a new TCP connection with retry mechanism
 def create_tcp_connection():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((TCP_IP, TCP_PORT))
-    return sock
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((IP_ADDRESS, TCP_PORT))
+            print("Connected to TCP server")
+            return sock
+        except Exception as e:
+            print(f"Failed to connect to TCP server: {e}")
+            print("Retrying in 5 seconds...")
+            time.sleep(5)
+
+# Send 'hello' packet to initiate named pipe creation
+def send_hello_packet(sock):
+    hello_message = 'pico_1'
+    sock.send(hello_message.encode())
 
 # Create initial TCP socket and connect
 s = create_tcp_connection()
-print("connected to TCP server")
+
+# Send hello packet and wait for confirmation
+send_hello_packet(s)
+
+led.on()
+
 try:
     while True:
         # Check for incoming UART data first
@@ -47,7 +64,7 @@ try:
             rxed = uart1.read().decode('utf-8').rstrip()
             s.send(rxed.encode())
             blink_led()
-            # print("from MechoNet: ", rxed)
+            # print("Serial device: ", rxed)
 
         # Non-blocking check for TCP data
         s.setblocking(False)
@@ -57,6 +74,8 @@ try:
                 print("TCP connection closed by server. Reconnecting...")
                 s.close()
                 s = create_tcp_connection()
+                # Send hello packet and wait for confirmation
+                send_hello_packet(s)
                 print("Reconnected to server.")
                 continue
 
@@ -64,7 +83,7 @@ try:
                 cmd = data.decode()
                 uart1.write(cmd)
                 blink_led()
-                # print("from Node-RED: ", cmd)
+                # print("TCP: ", cmd)
 
         except Exception as e:
             pass  # No data received, normal for non-blocking call
