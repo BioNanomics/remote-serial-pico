@@ -4,11 +4,11 @@ import time
 from machine import UART, Pin
 
 # Network credentials
-WIFI_SSID = 'mieweb-corp'
-WIFI_PASSWORD = 'REDACTED_WIFI_PASSWORD'
+WIFI_SSID = 'your_wifi_ssid'
+WIFI_PASSWORD = 'your_wifi_password'
 
 # Server details
-IP_ADDRESS = '10.3.136.129'
+IP_ADDRESS = 'your_device_ip_address'
 TCP_PORT = 50000
 
 # Initialize UART and LED
