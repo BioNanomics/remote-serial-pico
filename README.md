@@ -9,4 +9,4 @@
 At line 7, 8, 11 in the [`main.py`](./main.py) file, initialize the `WIFI_SSID`, `WIFI_PASSWORD`, `WIFI_PASSWORD` with the exact credentials.
 
 ## Images
-![pico](img/1.png)
+![pico](img/1.jpg)
