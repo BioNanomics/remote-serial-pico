@@ -11,16 +11,6 @@ let homebridgeSocket = null; // This will be the socket for the Homebridge clien
 let pipeReadStream = null;
 let pipePath = '';
 
-function safeExecSync(command) {
-    const sanitizedCommand = command.replace(/\x00/g, ''); // Remove null bytes
-    try {
-        child_process.execSync(sanitizedCommand);
-        // console.log(`Executed command: ${sanitizedCommand}`);
-    } catch (error) {
-        console.error(`Failed to execute command '${sanitizedCommand}': ${error}`);
-    }
-}
-
 function setupNamedPipe(filename) {
     // Sanitize filename to ensure it does not contain invalid characters or paths
     const sanitizedFilename = filename.replace(/[^a-zA-Z0-9_\-]+/g, '');
@@ -76,7 +66,7 @@ const server = net.createServer((socket) => {
                 picoSocket = null; // Clear the reference to allow a new connection
             });
 
-            setupNamedPipe(message); // Use message.slice(5) to remove 'pico_' prefix and setup pipe
+            setupNamedPipe(message);
         } else {
             // If it's not a Pico-W, assume it's Homebridge
             homebridgeSocket = socket; // Assign the Homebridge socket
@@ -111,9 +101,7 @@ server.listen(TCP_PORT, () => {
     console.log(`Server listening on TCP port ${TCP_PORT}`);
 });
 
-function cleanUp() {
-    console.log('Server is shutting down...');
-    
+function cleanUp() {    
     if (pipeReadStream) {
         pipeReadStream.close();
         pipeReadStream = null;
@@ -124,10 +112,7 @@ function cleanUp() {
 
     closeSocket(picoSocket); // Close the Pico-W socket
     closeSocket(homebridgeSocket); // Close the Homebridge socket
-
-    server.close(() => {
-        process.exit(0); // Exit immediately after server close
-    });
+    process.exit(0); // Exit
 }
 
 process.on('SIGINT', cleanUp).on('SIGTERM', cleanUp);
