@@ -19,9 +19,16 @@ This project enables communication between TCP networks and UART devices through
     cd ~/pico-network-serial-port/src
     node PtyServer.js
     ```
-* Follow any one of the two steps to run `PicoSerialClient.py` on Pico-W:
-    1. Connect your Pico-W to the Raspberry Pi or laptop and manually run [`PicoSerialClient.py`](./PicoSerialClient.py) in thonny (follow the steps in [get-started-pico-w](https://projects.raspberrypi.org/en/projects/get-started-pico-w/1)), make sure to initialize the `WIFI_SSID`, `WIFI_PASSWORD`, `IP_ADDRESS` with the exact credentials on lines 7, 8, 11 before running the code.
-    2. Use [PicoScriptDeployer](https://github.com/RajkumarGara/PicoScriptDeployer) to update the Wi-Fi credentials in [`PicoSerialClient.py`](./PicoSerialClient.py) and deploy the code subsequently.
+* Follow any one of the two steps to run **PicoSerialClient** on Pico-W:
+    1. Connect your Pico-W to the Raspberry Pi or laptop and manually run [`PicoSerialClient.py`](./src/PicoSerialClient.py) in thonny (follow the steps in [get-started-pico-w](https://projects.raspberrypi.org/en/projects/get-started-pico-w/1)), make sure to initialize the `WIFI_SSID`, `WIFI_PASSWORD`, `IP_ADDRESS` with the exact credentials on lines 7, 8, 11 before running the code.
+    2. Use [PicoScriptDeployer](https://github.com/RajkumarGara/PicoScriptDeployer) to update the Wi-Fi credentials in [`PicoSerialClient.py`](./src/PicoSerialClient.py) and deploy the code subsequently.
+* If you're using multiple Pico-W devices, make sure to assign a unique PICO_ID to each one manually on line 13 of the [`PicoSerialClient.py`](./src/PicoSerialClient.py) file before running the code.
+
+## Pico on-board LED status
+* The LED blinks repeatedly during the WiFi connection process. Once successfully connected, the LED switches off.
+* Upon successful connection to the TCP server, the LED switches on.
+* Whenever a command is received either from the TCP server or from a serially connected device, the LED blinks once.
+* When disconnected from the TCP server, the LED turns off.
 
 ## Visual Overview
 Below diagram depicts Raspberry Pi Pico-W units interfacing with devices for TCP to UART communication.
