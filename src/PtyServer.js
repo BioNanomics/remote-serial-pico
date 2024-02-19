@@ -111,12 +111,19 @@ const server = net.createServer((socket) => {
   });
 
   socket.on('close', () => {
-      if (picoNumber) {
-          console.log(`Pico-W client ${picoNumber} disconnected.`);
-          clearAndDeletePipes(picoNumber);
-          delete picoSockets[picoNumber];
-      }
-  });
+    if (picoNumber) {
+        // Delay the cleanup to check if the socket reconnects
+        setTimeout(() => {
+            // Check if the socket for the picoNumber has been reassigned (indicating a reconnection)
+            // or if it's truly disconnected before cleanup.
+            if (!picoSockets[picoNumber] || picoSockets[picoNumber].destroyed) {
+                console.log(`Pico-W client ${picoNumber} disconnected.`);
+                clearAndDeletePipes(picoNumber);
+                delete picoSockets[picoNumber];
+            }
+        }, 100); // 100ms delay
+    }
+});
 
   socket.on('error', (err) => {
       console.error('Socket error:', err);
