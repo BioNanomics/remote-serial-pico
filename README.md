@@ -1,12 +1,15 @@
 # About
-This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project serves as the second part, completing the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome) projects.
+This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project represents the second part, completing either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome) projects.
 
 ## PtyServer features
-1. **Pico Identification and File Management:** Automatically identifies Pico clients upon connection using a specific identifier format (pico_{number}), creating distinct command and response files for each.
-2. **Command Dispatching:** Watches for changes in command files, sending new commands to the respective Pico, and clears the file post-send to ready it for next commands.
-3. **Response Logging:** Records data received from Picos into their dedicated response files, facilitating external access to Pico responses.
-4. **Debounce Mechanism:** Implements a debounce strategy to prevent duplicate command processing and transmission due to rapid file modifications.
-5. **Cleanup on Disconnection:** Cleans up resources by closing connections, stopping file watchers, and deleting Pico-specific files upon disconnection.
+1. **Pico Identification and Pipe Management:** Automatically identifies Pico clients upon connection using a specific identifier format (pico_{number}), creating distinct command and response pipes for each.
+2. **Command Dispatching:** Watches for changes in command pipes, sending new commands to the respective Pico, and clears the pipe post-send to ready it for next commands.
+3. **Response Logging:** Records data received from Picos into their dedicated response pipes, facilitating external access to Pico responses.
+4. **Debounce Mechanism:** Implements a debounce strategy to prevent duplicate command processing and transmission due to rapid pipe modifications.
+5. **Cleanup on Disconnection:** Cleans up resources by closing connections, stopping pipe watchers, and deleting Pico-specific pipes upon disconnection.
+
+## Installation
+* Install nodejs latest version (should be atleast v20.11.1) on Raspberry Pi, following the steps on [install-nodejs](https://github.com/nodejs/help/wiki/Installation#how-to-install-nodejs-via-binary-archive-on-linux).
 
 ## Running the setup
 * Go to terminal on your Raspberry Pi and enter below command to clone this github repo (it clones to home directory. You can create a new folder and clone it there if you want).
@@ -22,7 +25,7 @@ This project enables communication between TCP networks and UART devices through
 * Follow any one of the two steps to run **PicoSerialClient** on Pico-W:
     1. Connect your Pico-W to the Raspberry Pi or laptop and manually run [`PicoSerialClient.py`](./src/PicoSerialClient.py) in thonny (follow the steps in [get-started-pico-w](https://projects.raspberrypi.org/en/projects/get-started-pico-w/1)), make sure to initialize the `WIFI_SSID`, `WIFI_PASSWORD`, `IP_ADDRESS` with the exact credentials on lines 7, 8, 11 before running the code.
     2. Use [PicoScriptDeployer](https://github.com/RajkumarGara/PicoScriptDeployer) to update the Wi-Fi credentials in [`PicoSerialClient.py`](./src/PicoSerialClient.py) and deploy the code subsequently.
-* If you're using multiple Pico-W devices, make sure to assign a unique PICO_ID to each one manually on line 13 of the [`PicoSerialClient.py`](./src/PicoSerialClient.py) file before running the code.
+* If you're using multiple Pico-W devices, make sure to assign a unique `PICO_ID` to each one manually on line 15 of the [`PicoSerialClient.py`](./src/PicoSerialClient.py) before running the code.
 
 ## Pico on-board LED status
 * The LED blinks repeatedly during the WiFi connection process. Once successfully connected, the LED switches off.
