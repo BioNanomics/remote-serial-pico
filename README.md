@@ -1,4 +1,21 @@
 # About
+Every need a serial port far away from your raspberry pi?  Wish you could use the WIFI to talk to a serial device without having to run a wire?  This project is for you.
+
+# Install for use
+
+```
+# npm install -g pico-network-serial-port
+# pico-network-serial-port install
+```
+
+Now a server is running on the PI.  If you plug in a pico to the USB it will install the client code on the pico and make it a remote serial port.
+
+`/tmp/ttyp1`
+
+It's that easy to setup a remote serial port.  Each time you plug in a pico, it will be the next ttypN on the list.
+
+# Background
+
 This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project represents the second part, completing either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome) projects.
 
 ## PtyServer features
@@ -8,7 +25,7 @@ This project enables communication between TCP networks and UART devices through
 4. **Debounce Mechanism:** Implements a debounce strategy to prevent duplicate command processing and transmission due to rapid pipe modifications.
 5. **Cleanup on Disconnection:** Cleans up resources by closing connections, stopping pipe watchers, and deleting Pico-specific pipes upon disconnection.
 
-## Installation
+## Installation for Development
 * Install nodejs latest version (should be atleast v20.11.1) on Raspberry Pi, following the steps on [install-nodejs](https://github.com/nodejs/help/wiki/Installation#how-to-install-nodejs-via-binary-archive-on-linux).
 
 ## Running the setup
