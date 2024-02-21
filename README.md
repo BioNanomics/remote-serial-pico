@@ -14,7 +14,6 @@ Now a server is running on the PI. If you plug in a pico to the USB it will inst
 It's that easy to setup a remote serial port.  Each time you plug in a pico, it will be the next pico_N on the list.
 
 ## Background
-
 This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
 
 ## PtyServer features
