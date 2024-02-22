@@ -14,11 +14,11 @@ Now a server is running on the PI. If you plug in a pico to the USB it will inst
 It's that easy to setup a remote serial port.  Each time you plug in a pico, it will be the next pico_N on the list.
 
 ## Background
-This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
+It enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
 
 ## Installation for Development
 * Install nodejs latest version (should be atleast v20.11.1) on Raspberry Pi, following the steps on [install-nodejs](https://github.com/nodejs/help/wiki/Installation#how-to-install-nodejs-via-binary-archive-on-linux).
-* Install `rshell` on Raspberry Pi by running the below command.
+* Install `rshell` on Raspberry Pi.
     ```
     sudo pip3 install rshell --break-system-packages
     ```
@@ -59,10 +59,11 @@ This project enables communication between TCP networks and UART devices through
     * Writes data received from Pico into corresponding response pipe.
     * Deletes corresponding Pico pipes upon disconnection.
 
-
 * **PicoScriptDeployer features:-**
-    * It automtically gets the `wifi-ssid, password, IP` and updates [`config.json`](./src/config.json), if not you can manually update it.
-    * It will deploy [`PicoSerialClient.py`](./src/PicoSerialClient.py) only to the most recently connected Pico, if multiple Picos are attached to Pi.
+    * Automtically obtains `wifi-ssid, password, IP` and updates [`config.json`](./src/config.json), if not you can manually update it.
+    * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from [`config.json`](./src/config.json).
+    * Renames PicoSerialClient.py as main.py and then deploys it to ensure Pico runs the code after power-on reset.
+    * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only, if multiple Picos are attached to Pi.
 
 ## Visual Overview
 * This diagram provides a general overview of the project.
