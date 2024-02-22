@@ -16,37 +16,53 @@ It's that easy to setup a remote serial port.  Each time you plug in a pico, it 
 ## Background
 This project enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. It's designed for IoT applications, providing a bridge for data exchange between network protocols and serial devices. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
 
-## PtyServer features
-1. **Pico Identification and Pipe Management:** Automatically identifies Pico clients upon connection using a specific identifier format (pico_{number}), creating distinct command and response pipes for each.
-2. **Command Dispatching:** Watches for changes in command pipes, sending new commands to the respective Pico, and clears the pipe post-send to ready it for next commands.
-3. **Response Logging:** Records data received from Picos into their dedicated response pipes, facilitating external access to Pico responses.
-4. **Debounce Mechanism:** Implements a debounce strategy to prevent duplicate command processing and transmission due to rapid pipe modifications.
-5. **Cleanup on Disconnection:** Cleans up resources by closing connections, stopping pipe watchers, and deleting Pico-specific pipes upon disconnection.
-
 ## Installation for Development
 * Install nodejs latest version (should be atleast v20.11.1) on Raspberry Pi, following the steps on [install-nodejs](https://github.com/nodejs/help/wiki/Installation#how-to-install-nodejs-via-binary-archive-on-linux).
+* Install `rshell` on Raspberry Pi by running the below command.
+    ```
+    sudo pip3 install rshell --break-system-packages
+    ```
 
 ## Running the setup
-* Go to terminal on your Raspberry Pi and enter below command to clone this github repo (it clones to home directory. You can create a new folder and clone it there if you want).
-    ```bash
+* Open terminal on your Raspberry Pi and enter below commands to clone this github repo.
+    ```
     cd ~
     git clone https://github.com/RajkumarGara/RemoteSerialPico
     ```
-* Navigate to `/RemoteSerialPico/src` folder and run `PtyServer.js`
-    ```bash
+* Create a udev rule that triggers on USB Pico connection. 
+    ```
     cd ~/RemoteSerialPico/src
+    sudo cp 99-pico.rules /etc/udev/rules.d/
+    ```
+* Reload Udev rules to apply the changes
+    ```
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    ```
+* Run `PtyServer.js` code
+    ```
     node PtyServer.js
     ```
-* Follow any one of the two steps to run **PicoSerialClient** on Pico-W:
-    1. Connect your Pico-W to the Raspberry Pi or laptop and manually run [`PicoSerialClient.py`](./src/PicoSerialClient.py) in thonny (follow the steps in [get-started-pico-w](https://projects.raspberrypi.org/en/projects/get-started-pico-w/1)), make sure to initialize the `WIFI_SSID`, `WIFI_PASSWORD`, `IP_ADDRESS` with the exact credentials on lines 7, 8, 11 before running the code.
-    2. Use [PicoScriptDeployer](https://github.com/RajkumarGara/PicoScriptDeployer) to update the Wi-Fi credentials in [`PicoSerialClient.py`](./src/PicoSerialClient.py) and deploy the code subsequently.
-* If you're using multiple Pico-W devices, make sure to assign a unique `PICO_ID` to each one manually on line 15 of the [`PicoSerialClient.py`](./src/PicoSerialClient.py) before running the code.
+* Connect your Pico-W to the Raspberry Pi. This will automatically install [`PicoSerialClient.py`](./src/PicoSerialClient.py) on the Pico-W.
+* When using multiple Pico-W devices for your project, ensure that each one is assigned a unique `PICO_ID` in  [`config.json`](./src/config.json), then reconnect the Pico.
 
 ## Pico on-board LED status
-* The LED blinks repeatedly during the WiFi connection process. Once successfully connected, the LED switches off.
-* Upon successful connection to the TCP server, the LED switches on.
-* Whenever a command is received either from the TCP server or from a serially connected device, the LED blinks once.
-* When disconnected from the TCP server, the LED turns off.
+* LED blinks repeatedly during the WiFi connection process. Upon successful connection it turns off.
+* LED switches on again when connected to the TCP server.
+* LED blinks once upon receiving a command either from TCP server or a serially connected device.
+* LED turns off when disconnected from the TCP server.
+
+## Developer Notes
+* **PtyServer features:-**
+    * Detects Pico clients using `pico_{N}` format, and assigns separate pipes.
+    * Sends data available in command pipe to the respective Pico and clears the pipe.
+    * Writes data received from Pico into corresponding response pipe.
+    * Deletes corresponding Pico pipes upon disconnection.
+
+
+* **PicoScriptDeployer features:-**
+    * It automtically gets the `wifi-ssid, password, IP` and updates [`config.json`](./src/config.json), if not you can manually update it.
+    * It will deploy [`PicoSerialClient.py`](./src/PicoSerialClient.py) only to the most recently connected Pico, if multiple Picos are attached to Pi.
 
 ## Visual Overview
 * This diagram provides a general overview of the project.
