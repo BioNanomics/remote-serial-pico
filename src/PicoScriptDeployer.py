@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+import datetime
 import os
 import subprocess
 import sys
@@ -46,34 +48,46 @@ def get_ip_address():
         s.close()
     return IP
 
+# load default config if the json file is invalid 
+def load_or_initialize_config(config_path):
+    default_config = {
+        'WIFI_SSID': 'your_wifi_ssid',
+        'WIFI_PASSWORD': 'your_wifi_password',
+        'IP_ADDRESS': 'your_ip_address',
+        'PICO_ID': '1'
+    }
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as file:
+                return json.load(file)
+        except json.JSONDecodeError:
+            return default_config
+    else:
+        return default_config
+
 # Update or create config.json with current network settings and PICO_ID.
 def update_config_json():
     ssid, wifi_password = get_wifi_ssid_pswd(get_wifi_ssid())
     ip_address = get_ip_address()
-    
+
     # Path to the configuration file.
-    config_path = 'config.json'
-    # Default configuration structure.
-    config_data = {
-        'WIFI_SSID': ssid if ssid else 'your_wifi_ssid',
-        'WIFI_PASSWORD': wifi_password if wifi_password else 'your_wifi_password',
-        'IP_ADDRESS': ip_address if ip_address else 'your_ip_address',
-        'PICO_ID': '1'
-    }
-    
-    # Load existing configuration if available, to preserve other settings.
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as file:
-            try:
-                existing_data = json.load(file)
-                config_data.update(existing_data)  # Merge the new data with existing.
-            except json.JSONDecodeError:
-                # If the existing file is not valid JSON, it's ignored.
-                pass
-    
-    # Write the merged or default configuration back to the file.
-    with open(config_path, 'w') as file:
-        json.dump(config_data, file, indent=4)
+    config_path = '/home/RemoteSerialPico/src/config.json'
+    config_data = load_or_initialize_config(config_path)
+
+    updates_necessary = False
+    if ssid:
+        config_data['WIFI_SSID'] = ssid
+        updates_necessary = True
+    if wifi_password:
+        config_data['WIFI_PASSWORD'] = wifi_password
+        updates_necessary = True
+    if ip_address:
+        config_data['IP_ADDRESS'] = ip_address
+        updates_necessary = True
+
+    if updates_necessary:
+        with open(config_path, 'w') as file:
+            json.dump(config_data, file, indent=4)
 
 # Detect all connected Raspberry Pi Picos by their USB IDs.
 def get_connected_picos():
@@ -84,7 +98,7 @@ def get_connected_picos():
 
 # Read the configuration from config.json and update the script with these settings.
 def read_config_and_update_main():
-    config_path = 'config.json'
+    config_path = '/home/RemoteSerialPico/src/config.json'
     # Load the configuration, falling back to defaults if the file doesn't exist.
     if os.path.exists(config_path):
         with open(config_path, 'r') as file:
@@ -93,7 +107,7 @@ def read_config_and_update_main():
         config_data = {}
 
     # Open the script file and prepare to update it with configuration values.
-    with open('PicoSerialClient.py', 'r') as main_file:
+    with open('/home/RemoteSerialPico/src/PicoSerialClient.py', 'r') as main_file:
         main_lines = main_file.readlines()
 
     # Update the script lines with configuration values.
@@ -103,14 +117,14 @@ def read_config_and_update_main():
     main_lines[14] = f"PICO_ID = {config_data.get('PICO_ID', '1')}\n"
 
     # Write the updated lines back to the script file.
-    with open('PicoSerialClient.py', 'w') as main_file:
+    with open('/home/RemoteSerialPico/src/PicoSerialClient.py', 'w') as main_file:
         main_file.writelines(main_lines)
     print("PicoSerialClient.py is updated with the WiFi credentials and PICO_ID from config.json")
 
 # Prepare the script for transfer to the Pico by creating a copy named main.py.
 def prepare_script_for_transfer():
-    if os.path.exists('PicoSerialClient.py'):
-        shutil.copy('PicoSerialClient.py', 'main.py')
+    if os.path.exists('/home/RemoteSerialPico/src/PicoSerialClient.py'):
+        shutil.copy('/home/RemoteSerialPico/src/PicoSerialClient.py', '/home/RemoteSerialPico/src/main.py')
         print("PicoSerialClient.py has been copied to main.py for transfer.")
     else:
         print("PicoSerialClient.py does not exist, skipping preparation.")
@@ -119,17 +133,19 @@ def prepare_script_for_transfer():
 def transfer_script_to_pico(port):
     prepare_script_for_transfer()
     # Use rshell to copy the script to the Pico.
-    os.system(f'rshell -p {port} "cp main.py /pyboard"')
-    os.remove('main.py')  # Clean up the temporary file.
+    os.system(f'rshell -p {port} "cp /home/RemoteSerialPico/src/main.py /pyboard"')
+    os.remove('/home/RemoteSerialPico/src/main.py')  # Clean up the temporary file.
 
 # Perform a soft reset on the Pico to restart it with the new script.
 def reset_pico(port):
     os.system(f'rshell -p {port} repl "~ import machine ~ machine.reset() ~"')
 
 def main():
+
     if not is_root_user():
         print("Restarting script with sudo for Wi-Fi credentials.")
         subprocess.check_call(["sudo", sys.executable] + sys.argv)
+
     else:
         update_config_json()  # Ensure the configuration file is current.
         print("Config.json updated or created with default values if empty.")
@@ -150,6 +166,7 @@ def main():
 
             known_picos = current_connected_picos
             time.sleep(5)  # Wait before checking for new connections again.
+
 
 if __name__ == "__main__":
     main()
