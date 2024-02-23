@@ -14,7 +14,7 @@ Now a server is running on the PI. If you plug in a pico to the USB it will inst
 It's that easy to setup a remote serial port.  Each time you plug in a pico, it will be the next pico_N on the list.
 
 ## Background
-It enables communication between TCP networks and UART devices through a Raspberry Pi Pico-W. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
+Designed to facilitate communication between a remote device (such as a Raspberry Pi) and a device connected via serial to the Pico. It leverages TCP/IP networking to bridge data exchange between the Pico's serial interface and a networked environment. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
 
 ## Installation for Development
 * Install nodejs latest version (should be atleast v20.11.1) on Raspberry Pi, following the steps on [install-nodejs](https://github.com/nodejs/help/wiki/Installation#how-to-install-nodejs-via-binary-archive-on-linux).
@@ -24,17 +24,18 @@ It enables communication between TCP networks and UART devices through a Raspber
     ```
 
 ## Running the setup
-* Open terminal on your Raspberry Pi and enter below commands to clone this github repo.
+* Open terminal on your Raspberry Pi and enter below commands to clone this github repo and give full permission to the source files.
     ```
-    cd ~
-    git clone https://github.com/RajkumarGara/RemoteSerialPico
+    cd /home
+    sudo git clone https://github.com/RajkumarGara/RemoteSerialPico
+    sudo chmod -R ugo+rwx /home/RemoteSerialPico/src
     ```
 * Create a udev rule that triggers on USB Pico connection. 
     ```
-    cd ~/RemoteSerialPico/src
+    cd /home/RemoteSerialPico/src
     sudo cp 99-pico.rules /etc/udev/rules.d/
     ```
-* Reload Udev rules to apply the changes
+* Reload udev rules to apply the changes
     ```
     sudo udevadm control --reload-rules
     sudo udevadm trigger
