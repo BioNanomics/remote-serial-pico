@@ -2,7 +2,7 @@
 Ever need a serial port far away from your Raspberry Pi? Wish you could use WiFi to talk to a serial device without having to run a wire? This project is for you.
 
 ## Install for use
-<img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" style="float: right;">
+<img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" align="right"/>
 
 ```
 $ npm install -g RemoteSerialPico
@@ -23,24 +23,26 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     ```
     sudo apt update && sudo apt upgrade
     curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-    sudo apt install nodejs && node -v && npm -v
+    sudo apt install nodejs
     ```
 
 * Install `rshell` on Raspberry Pi.
     ```
-    sudo pip3 install rshell --break-system-packages
+    sudo mkdir -m 777 /home/project && cd /home/project
+    sudo apt update && sudo apt install python3-venv python3-pip
+    python3 -m venv myenv && source myenv/bin/activate
+    pip install rshell
     ```
 
 ## Running the setup
-* Open terminal on your Raspberry Pi and enter below commands to clone this github repo and give full permission to the source files.
+* Open terminal on your Raspberry Pi and enter below commands to clone this github repo.
     ```
-    cd /home
-    sudo git clone https://github.com/RajkumarGara/RemoteSerialPico
-    sudo chmod -R ugo+rwx /home/RemoteSerialPico/src
+    cd /home/project
+    git clone https://github.com/RajkumarGara/RemoteSerialPico
     ```
 * Create a udev rule that triggers on USB Pico connection. 
     ```
-    cd /home/RemoteSerialPico/src
+    cd /home/project/RemoteSerialPico/src
     sudo cp 99-pico.rules /etc/udev/rules.d/
     ```
 * Reload udev rules to apply the changes
@@ -52,8 +54,7 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     ```
     node PtyServer.js
     ```
-* Connect your Pico-W to the Raspberry Pi. This will automatically install [`PicoSerialClient.py`](./src/PicoSerialClient.py) on the Pico-W.
-* When using multiple Pico-W devices for your project, ensure that each one is assigned a unique `PICO_ID` in  [`config.json`](./src/config.json), then reconnect the Pico.
+* Connect your Pico-W to the Raspberry Pi. This will automatically install [`PicoSerialClient.py`](./src/PicoSerialClient.py) on the Pico-W within 5sec.
 
 ## Pico on-board LED status
 * LED blinks repeatedly during the WiFi connection process. Upon successful connection it turns off.
@@ -73,7 +74,7 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * If it detects any new connections, it will simply run the [PicoScriptDeployer.py](./src/PicoScriptDeployer.py) on Pi.
 
 * **And what exactly does PicoScriptDeployer do?**
-    * Automtically obtains `wifi-ssid, password, IP` and updates [`config.json`](./src/config.json). Sometimes it couldn't get the password; you can **manually update** it in config.json.
+    * Automtically obtains `wifi-ssid, password, IP, Pico-serial-id` and updates [`config.json`](./src/config.json). Sometimes it couldn't get the password; you can always **manually update** it in config.json.
     * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from config.json.
     * Renames PicoSerialClient.py as main.py and then deploys it to ensure Pico runs the code after power-on reset.
     * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only, if multiple Picos are attached to Pi.
