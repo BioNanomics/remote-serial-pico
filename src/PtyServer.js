@@ -8,6 +8,8 @@ const TCP_PORT = 50000; // TCP port for the server to listen on
 const RESPONSE_SUFFIX = '_response'; // Suffix for response pipes
 const DEBOUNCE_TIME = 200; // Time in milliseconds to debounce pipe changes
 
+let serialIdToPicoNumber = {}; // Maps Pico serial IDs to Pico numbers
+let nextPicoNumber = 1; // Tracks the next Pico number to assign
 let picoSockets = {}; // Store sockets for each Pico-W, keyed by pico number
 let picoPipes = {}; // Store command pipe paths for each Pico-W
 let picoResponsePipes = {}; // Store response pipe paths for each Pico-W
@@ -94,20 +96,26 @@ function clearAndDeletePipes(picoNumber) {
 
 // Create TCP server
 const server = net.createServer((socket) => {
-  let picoNumber = null;
+    let picoNumber = null;
 
-  socket.on('data', (data) => {
-      const message = data.toString().trim();
-      const sanitizedMessage = sanitizeInput(message);
+    socket.on('data', (data) => {
+    const message = data.toString().trim();
+    const sanitizedMessage = sanitizeInput(message);
 
-      // Check if the message is an identifier
-      if (sanitizedMessage.startsWith('pico_')) {
-          picoNumber = sanitizedMessage.slice(5); // Extract Pico number from the identifier
-          handlePicoConnection(picoNumber, socket);
-      } else if (picoNumber) {
-          // If we have a picoNumber, it means this is data from the Pico
-          writeResponseToPipe(picoNumber, data);
-      }
+    // Check if the message is an identifier
+    if (sanitizedMessage.startsWith('pico_')) {
+        const serialId = sanitizedMessage.slice(5); // Extract Pico serial ID from the identifier
+        // Assign a new Pico number if this is a new serial ID
+        if (!serialIdToPicoNumber[serialId]) {
+            serialIdToPicoNumber[serialId] = nextPicoNumber++;
+        }
+        // Use the mapped Pico number for connection handling
+        picoNumber = serialIdToPicoNumber[serialId];
+        handlePicoConnection(picoNumber.toString(), socket); 
+    } else if (picoNumber) {
+        // If we have a picoNumber, it means this is data from the Pico
+        writeResponseToPipe(picoNumber.toString(), data);
+    }
   });
 
   socket.on('close', () => {
