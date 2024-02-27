@@ -7,7 +7,11 @@ import socket
 import json
 
 # Define the base directory for the project
-BASE_DIR = '/home/RemoteSerialPico/src/'
+BASE_DIR = '/home/project/RemoteSerialPico/src/'
+
+def log_message(message):
+    with open('/tmp/udev_test.log', 'a') as log_file:
+        log_file.write(f'{message}\n')
 
 # Fetch the SSID of the currently active WiFi connection using nmcli command.
 def get_wifi_ssid():
@@ -70,16 +74,22 @@ def update_config_json(pico_serial_id):
     config_path = os.path.join(BASE_DIR, 'config.json')
     config_data = load_or_initialize_config(config_path)
 
+    password_flg = False
+
     if ssid:
         config_data['WIFI_SSID'] = ssid
 
     if wifi_password:
         config_data['WIFI_PASSWORD'] = wifi_password
+        password_flg = True
 
     if ip_address:
         config_data['IP_ADDRESS'] = ip_address
 
     config_data['PICO_ID'] = str(pico_serial_id)
+
+    if not password_flg:
+        log_message(f'Unable to obtain Wi-Fi password. Manually update it on config.json')
 
     with open(config_path, 'w') as file:
         json.dump(config_data, file, indent=4)
@@ -113,11 +123,16 @@ def read_config_and_update_main():
 def transfer_script_to_pico(port):
     source_path = os.path.join(BASE_DIR, 'PicoSerialClient.py')
     destination_path = os.path.join(BASE_DIR, 'main.py')
-    
     os.rename(source_path, destination_path)
-    os.system(f'rshell -p {port} "cp {destination_path} /pyboard"')
-    os.rename(destination_path, source_path)
 
+    # Attempt to transfer using rshell with the explicit path to the virtualenv's rshell
+    try:
+        subprocess.check_call(['/home/project/myenv/bin/rshell', '-p', port, f'cp {destination_path} /pyboard'])
+    except subprocess.CalledProcessError as e:
+        log_message(f'Error during transfer: {str(e)}')
+    finally:
+        os.rename(destination_path, source_path)
+        log_message(f'Script deployed :) Time: {datetime.datetime.now()}')
 
 def main():
     devname = sys.argv[1]
@@ -125,12 +140,10 @@ def main():
     # id_model_id = sys.argv[3]
     pico_serial_id = sys.argv[4]
     
+    log_message(f'Pico detected; Port: {devname}, Serial_ID: {pico_serial_id}, Time: {datetime.datetime.now()}')
     update_config_json(pico_serial_id)
     read_config_and_update_main()
     transfer_script_to_pico(devname)
-
-    with open('/tmp/udev_test.log', 'a') as log_file:
-        log_file.write(f'DEVNAME: {devname}, PICO_SERIAL_ID: {pico_serial_id}, Time: {datetime.datetime.now()}\n')
 
 if __name__ == "__main__":
     main()
