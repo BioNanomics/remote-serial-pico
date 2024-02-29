@@ -1,0 +1,34 @@
+{
+  "name": "remote-serial-pico",
+  "version": "1.0.0",
+  "description": "Access remote serial devices connected to Pico with Pi",
+  "main": "remote-serial-pico.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node remote-serial-pico.js"
+  },
+  "bin": {
+    "remote-serial-pico": "./bin/remote-serial-pico.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RajkumarGara/remote-serial-pico.git"
+  },
+  "keywords": [
+    "raspberry-pi",
+    "serial",
+    "tcp",
+    "uart",
+    "pico-w",
+    "remote-serial",
+    "mechonet",
+    "lmdi-100"
+  ],
+  "author": "Rajkumar Gara",
+  "license": "ISC",
+  "dependencies": {},
+  "bugs": {
+    "url": "https://github.com/RajkumarGara/remote-serial-pico/issues"
+  },
+  "homepage": "https://github.com/RajkumarGara/remote-serial-pico#readme"
+}
