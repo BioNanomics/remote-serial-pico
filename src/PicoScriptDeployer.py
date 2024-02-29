@@ -7,7 +7,7 @@ import socket
 import json
 
 # Define the base directory for the project
-BASE_DIR = '/home/project/RemoteSerialPico/src/'
+BASE_DIR = '/home/project/remote-serial-pico/src/'
 
 def log_message(message):
     with open('/tmp/udev_test.log', 'a') as log_file:
