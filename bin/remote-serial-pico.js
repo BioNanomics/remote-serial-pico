@@ -25,7 +25,6 @@ sudo udevadm trigger
 
 
 function runCommands(commands) {
-  console.log(`Executing: ${commands}`);
   execSync(commands, { stdio: 'inherit', shell: true });
 }
 

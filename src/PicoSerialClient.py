@@ -87,6 +87,7 @@ try:
 
             if data:	# Valid data received from TCP Server
                 cmd = data.decode()
+                uart1.write(cmd)
                 blink_led()
                 #print("TCP: ", cmd)
 

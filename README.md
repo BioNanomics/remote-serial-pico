@@ -1,11 +1,8 @@
 # About
 Ever need a serial port far away from your Raspberry Pi? Wish you could use WiFi to talk to a serial device without having to run a wire? This project is for you.
 
-## Install for use
-<div style="padding: 5%;"> <!-- Adjust the padding value as needed -->
-    <img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" align="right"/>
-</div>
-
+## Installation
+<img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" style="float:right; margin: 10%;"/>
 
 ```
 npm install -g remote-serial-pico
@@ -46,7 +43,10 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 ## Visual Overview
 * This diagram provides a general overview of the project. For more infomation checkout [detailed diagram](img/2.jpg).
-    ![general diagram](img/1.jpg)
+    ![block diagram](img/1.jpg)
+
+* Click below to watch the Smart Window Blinds video:
+    [![Watch the video](img/4.jpg)](https://youtu.be/M36LoMouvPg)
 
 ## Credits
 Special thanks to [Medical Informatics Engineering](https://www.mieweb.com/) for their support throughout the development of this project, especially to [Doug Horner](https://github.com/horner) for his invaluable guidance.
