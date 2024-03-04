@@ -13,12 +13,12 @@ Now a server is running on the Pi. If you plug in a Pico to the USB it will inst
 
 `/tmp/pico_1`
 
-It's that easy to setup a remote serial port. Each time you plug in a pico, it will be the next pico_N on the list.
+It's that easy to setup a remote serial port. Each time you plug in a pico, it will be the next `pico_N` on the list.
 
 ### Background
-Designed to facilitate communication between a remote device (such as a Raspberry Pi) and a device connected via serial to the Pico. It leverages TCP/IP networking to bridge data exchange between the Pico's serial interface and a networked environment. This project can be extended using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
+Designed to facilitate communication between a remote device (such as a Raspberry Pi) and a device connected via serial to the Pico. It leverages TCP/IP networking to bridge data exchange between the Pico's serial interface and a networked environment. Extend this project using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
 
-## Pico on-board LED status
+### Pico on-board LED status
 * LED blinks repeatedly during the WiFi connection process. Upon successful connection it turns off.
 * LED switches on again when connected to the TCP server.
 * LED blinks once upon receiving a command either from TCP server or a serially connected device.
@@ -36,16 +36,16 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * If it detects any new connections, it will simply run the [PicoScriptDeployer.py](./src/PicoScriptDeployer.py) on Pi.
 
 * **And what exactly does PicoScriptDeployer do?**
-    * Automtically obtains `wifi-ssid, password, IP, Pico-serial-id` and updates [`config.json`](./src/config.json). Sometimes it couldn't get the password; you can always **manually update** it in config.json.
+    * Automtically obtains `wifi-ssid, password, IP, Pico-serial-id` and updates the corresponding credentials on [`config.json`](./src/config.json). You can also manually update it.
     * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from config.json.
     * Renames PicoSerialClient.py as main.py and then deploys it to ensure Pico runs the code after power-on reset.
     * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only, if multiple Picos are attached to Pi.
 
 ## Visual Overview
-* This diagram provides a general overview of the project. For more infomation checkout [detailed diagram](img/2.jpg).
+* This diagram provides a general overview of the project. Checkout [detailed diagram](img/2.jpg).
     ![block diagram](img/1.jpg)
 
-* Click below to watch the Smart Window Blinds video:
+* Click to watch it on youtube:
     [![Watch the video](img/4.GIF)](https://youtu.be/M36LoMouvPg)
 
 ## Credits

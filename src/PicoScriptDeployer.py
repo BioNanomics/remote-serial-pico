@@ -24,15 +24,23 @@ def get_wifi_ssid():
 
 # Retrieve WiFi credentials for a given SSID from the system's network manager.
 def get_wifi_ssid_pswd(ssid):
-    config_path = f'/etc/NetworkManager/system-connections/{ssid}.nmconnection' if ssid else None
-    psk = None  # Initialize psk to None.
-    if config_path and os.path.exists(config_path):
-        with open(config_path, 'r') as file:
-            # Search for the psk line within the connection file.
-            for line in file:
-                if 'psk=' in line:
-                    psk = line.split('=')[1].strip()
-                    break  # Break after finding the psk to avoid unnecessary processing.
+
+    config_path1 = f'/etc/NetworkManager/system-connections/{ssid}.nmconnection' if ssid else None
+    config_path2 = '/etc/NetworkManager/system-connections/preconfigured.nmconnection'
+    
+    # Function to extract psk from a given config path
+    def extract_psk_from_config(config_path):
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as file:
+                for line in file:
+                    if 'psk=' in line:
+                        return line.split('=')[1].strip()
+        return None
+    
+    psk = extract_psk_from_config(config_path1)
+    # If PSK not found in the first path, try the second path
+    if psk is None:
+        psk = extract_psk_from_config(config_path2)
     return ssid, psk
 
 # Determine the external IP address of the Raspberry Pi.
