@@ -32,20 +32,19 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Deletes corresponding Pico pipes upon disconnection.
 
 * **Wondering how plugging Pico into the Pi installs PicoSerialClient.py?**
-    * The udev rule ([99-pico.rules](./src/99-pico.rules)) will monitor the Pi's USB port for connections.
-    * If it detects any new connections, it will simply run the [PicoScriptDeployer.py](./src/PicoScriptDeployer.py) on Pi.
+    * The udev rule ([99-pico.rules](./src/99-pico.rules)) watches for Pico devices connecting to the Raspberry Pi.
+    * When a Pico is connected, it triggers another script [PicoScriptDeployer.py](./src/PicoScriptDeployer.py) to run on Pi.
 
 * **And what exactly does PicoScriptDeployer do?**
-    * Automtically obtains `wifi-ssid, password, IP, Pico-serial-id` and updates the corresponding credentials on [`config.json`](./src/config.json). You can also manually update it.
+    * It fetches `wifi-ssid, password, IP, Pico-serial-id` and updates the corresponding credentials on [`config.json`](./src/config.json). You can also manually update it.
     * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from config.json.
-    * Renames PicoSerialClient.py as main.py and then deploys it to ensure Pico runs the code after power-on reset.
-    * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only, if multiple Picos are attached to Pi.
+    * Renames and deploys PicoSerialClient.py as main.py for auto-execution on Pico restart.
+    * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only.
 
 ## Visual Overview
-* This diagram provides a general overview of the project. Checkout [detailed diagram](img/2.jpg).
+* Checkout [detailed diagram](img/2.jpg).
     ![block diagram](img/1.jpg)
 
-* Click to watch it on youtube:
     [![Watch the video](img/4.GIF)](https://youtu.be/M36LoMouvPg)
 
 ## Credits
