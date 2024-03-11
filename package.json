@@ -1,6 +1,6 @@
 {
   "name": "remote-serial-pico",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Access remote serial devices connected to Pico with Pi",
   "main": "remote-serial-pico.js",
   "scripts": {
@@ -26,7 +26,9 @@
   ],
   "author": "Rajkumar Gara",
   "license": "ISC",
-  "dependencies": {},
+  "dependencies": {
+    "moment-timezone": "^0.5.45"
+  },
   "bugs": {
     "url": "https://github.com/RajkumarGara/remote-serial-pico/issues"
   },

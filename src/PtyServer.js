@@ -2,6 +2,7 @@
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const moment = require('moment-timezone');
 
 const PIPE_DIR = '/tmp'; // Directory where named pipes will be stored
 const TCP_PORT = 50000; // TCP port for the server to listen on
@@ -15,6 +16,45 @@ let picoPipes = {}; // Store command pipe paths for each Pico-W
 let picoResponsePipes = {}; // Store response pipe paths for each Pico-W
 let fileWatchers = {}; // Store file watchers for command pipes
 let debounceTimers = {}; // Store debounce timers for each Pico
+
+// Create a writable stream to log commands and responses
+const LOG_FILE_PATH = '/tmp/smart_home.log';
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB in bytes
+
+function createLogFile() {
+    try {
+        fs.accessSync(LOG_FILE_PATH, fs.constants.F_OK);
+    } catch (err) {
+        try {
+            fs.writeFileSync(LOG_FILE_PATH, '');
+        } catch (err) {
+            console.error('Error creating log file:', err);
+        }
+    }
+}
+
+function logMessage(message) {
+    try {
+        const stats = fs.statSync(LOG_FILE_PATH);
+        const fileSize = stats.size;
+
+        if (fileSize > MAX_FILE_SIZE_BYTES) {
+            fs.writeFileSync(LOG_FILE_PATH, ''); // Empty the file if it exceeds the limit
+        }
+    } catch (err) {
+        console.error('Error accessing log file:', err);
+    }
+
+    const logStream = fs.createWriteStream(LOG_FILE_PATH, { flags: 'a' });
+    logStream.write(`${getCurrentDateTimeInEST()} ${message}\n`);
+    logStream.end();
+}
+
+function getCurrentDateTimeInEST() {
+    return moment().tz('America/New_York').format('YYYY-MM-DD HH:mm:ss.S');
+}
+
+createLogFile();
 
 function sanitizeInput(input) {
     // Remove null bytes and other non-printable characters
@@ -56,9 +96,9 @@ function setupPipeForPico(picoNumber) {
                   }
                   if (data && picoSockets[picoNumber]) {
                       picoSockets[picoNumber].write(data);
-                      fs.writeFileSync(commandPipePath, '', { flag: 'w' }); // Clear pipe after sending command
-                      console.log(`Command sent to Pico ${picoNumber}: ${data}`);
-                  }
+                      fs.writeFileSync(commandPipePath, '', { flag: 'w' });
+                      logMessage(`[Pico ${picoNumber} - command] ${data.toString().trim()}`);
+                    }
               });
           }, DEBOUNCE_TIME);
       }
@@ -70,7 +110,7 @@ function writeResponseToPipe(picoNumber, data) {
     const responsePipePath = picoResponsePipes[picoNumber];
     if (responsePipePath) {
         fs.writeFileSync(responsePipePath, data);
-        console.log(`Response from Pico ${picoNumber} written to pipe: ${responsePipePath}`);
+        logMessage(`[Pico ${picoNumber} - response] ${data.toString().trim()}`);
     }
 }
 

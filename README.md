@@ -5,7 +5,7 @@ Ever need a serial port far away from your Raspberry Pi? Wish you could use WiFi
 <img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" align="right"/>
 
 ```
-npm install -g remote-serial-pico
+sudo npm install -g remote-serial-pico
 remote-serial-pico install
 ```
 
@@ -14,6 +14,12 @@ Now a server is running on the Pi. If you plug in a Pico to the USB it will inst
 `/tmp/pico_1`
 
 It's that easy to setup a remote serial port. Each time you plug in a pico, it will be the next `pico_N` on the list.
+
+If you haven't already installed npm:
+```
+sudo apt update
+sudo apt install nodejs npm
+```
 
 ### Background
 Designed to facilitate communication between a remote device (such as a Raspberry Pi) and a device connected via serial to the Pico. It leverages TCP/IP networking to bridge data exchange between the Pico's serial interface and a networked environment. Extend this project using either the [`node-red-bridge`](https://github.com/RajkumarGara/node-red-bridge) or [`homebridge-tcp-smarthome`](https://github.com/RajkumarGara/homebridge-tcp-smarthome).
@@ -24,7 +30,7 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 * LED blinks once upon receiving a command either from TCP server or a serially connected device.
 * LED turns off when disconnected from the TCP server.
 
-## Project Q&A
+## Project Details
 * **Curious about PtyServer?**
     * Detects Pico clients upon receiving first packet with `pico_{N}`, and assigns separate pipes.
     * Sends data available in command pipe to the respective Pico and clears the pipe.
@@ -40,6 +46,11 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from config.json.
     * Renames and deploys PicoSerialClient.py as main.py for auto-execution on Pico restart.
     * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only.
+
+* **Wanna check out the commands log?**
+    ```
+    tail -f /tmp/smart_home.log
+    ```
 
 ## Visual Overview
 * Checkout [detailed diagram](img/2.jpg).

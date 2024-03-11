@@ -10,6 +10,8 @@ const installRshellCommands = [
   '/home/project/myenv/bin/pip install rshell'
 ].join(' && ');
 
+const npmInstallCommand = 'sudo npm install';
+
 const setupProjectCommands = `
 cd /home/project && 
 if [ ! -d "remote-serial-pico" ] || [ -z "$(ls -A remote-serial-pico)" ]; then 
@@ -23,13 +25,14 @@ sudo udevadm control --reload-rules &&
 sudo udevadm trigger
 `;
 
-
 function runCommands(commands) {
   execSync(commands, { stdio: 'inherit', shell: true });
 }
 
 console.log("Installing rshell and other dependencies...");
 runCommands(installRshellCommands);
+console.log("Installing dependencies listed in package.json...");
+runCommands(npmInstallCommand);
 console.log("Setting up remote-serial-pico project...");
 runCommands(setupProjectCommands);
 console.log("Starting the project...");
