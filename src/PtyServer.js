@@ -61,6 +61,20 @@ function sanitizeInput(input) {
     return String(input).replace(/[\x00-\x1F\x7F-\x9F]/g, '');
 }
 
+// See https://gist.github.com/horner/d3d41ec3ce0f773c33a2652540fc2646
+function setupPtyforPico() {
+    const myPty = pty.open();
+    console.log("Made virtual tty:" + myPty.ptsName);
+    // Make a logical link to the tty with the pico number
+    picoResponsePipes[picoNumber] = myPty; // Store off the ptyy
+    myPty._master.on('data', (data) => {
+      // write this to the network
+      console.log(data.toString());
+    });
+}
+
+    
+
 // Setup command and response pipes for a given Pico-W
 function setupPipeForPico(picoNumber) {
   const sanitizedNumber = sanitizeInput(picoNumber);
