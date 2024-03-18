@@ -5,11 +5,11 @@ Ever need a serial port far away from your Raspberry Pi? Wish you could use WiFi
 <img src="./img/3.GIF" alt="Pico-Pi connection" width="40%" align="right"/>
 
 ```
-sudo npm install -g remote-serial-pico
-remote-serial-pico install
+sudo npm i -g remote-serial-pico
+remote-serial-pico i
 ```
 
-Now a server is running on the Pi. If you plug in a Pico to the USB it will install the client code on the pico and make it a remote serial port.
+Now a server is running on the Pi. If you plug in a Pico to the USB it will install the client code on the pico within 6 sec and make it a remote serial port.
 
 `/tmp/pico_1`
 
@@ -32,25 +32,31 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 ## Project Details
 * **Curious about PtyServer?**
-    * Detects Pico clients upon receiving first packet with `pico_{N}`, and assigns separate pipes.
+    * Detects Pico clients upon receiving first packet with `pico_{N}`, and assigns separate pipes for each Pico.
     * Sends data available in command pipe to the respective Pico and clears the pipe.
     * Writes data received from Pico into corresponding response pipe.
     * Deletes corresponding Pico pipes upon disconnection.
 
-* **Wondering how plugging Pico into the Pi installs PicoSerialClient.py?**
-    * The udev rule ([99-pico.rules](./src/99-pico.rules)) watches for Pico devices connecting to the Raspberry Pi.
-    * When a Pico is connected, it triggers another script [PicoScriptDeployer.py](./src/PicoScriptDeployer.py) to run on Pi.
+* **Wondering how plugging Pico into the Pi installs client code in Pico?**
+    * The udev rule ([99-pico.rules](./src/99-pico.rules)) watches Pi's USB port for Pico connection.
+    * When a Pico is connected, it triggers another script [PicoScriptDeployer.py](./src/pi/PicoScriptDeployer.py) to run on Pi.
 
 * **And what exactly does PicoScriptDeployer do?**
-    * It fetches `wifi-ssid, password, IP, Pico-serial-id` and updates the corresponding credentials on [`config.json`](./src/config.json). You can also manually update it.
-    * Modifies [`PicoSerialClient.py`](./src/PicoSerialClient.py) with the credentials from config.json.
-    * Renames and deploys PicoSerialClient.py as main.py for auto-execution on Pico restart.
-    * Deploys [`PicoSerialClient.py`](./src/PicoSerialClient.py) to the most recently connected Pico only.
+    * It fetches `wifi-ssid, password, IP, Pico-Serial-ID` and updates the corresponding credentials on [config.json](./src/pico/config.json). You can also manually update it.
+    * Deploys [`main.py`](./src/pico/main.py) and [`config.json`](./src/pico/config.json) to the most recently connected pico.
+    * You can observe the deployer log:
+        ```
+        tail -f /tmp/deployer.log
+        ``` 
 
-* **Wanna check out the commands log?**
-    ```
-    tail -f /tmp/smart_home.log
-    ```
+* **Now, what's the role of the main code in Pico?**
+    * Retrieves the network credentials and server details from the `config.json`.
+    * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
+    * Continuously checks for data in TCP or Serial; if it receives data from either, it sends that data to the other. 
+    * You can checkout the commands and responses log:
+        ```
+        tail -f /tmp/smart_home.log
+        ```
 
 ## Visual Overview
 * Checkout [detailed diagram](img/2.jpg).

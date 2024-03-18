@@ -1,1 +1,0 @@
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", RUN+="/home/project/myenv/bin/python /home/project/remote-serial-pico/src/PicoScriptDeployer.py '%E{DEVNAME}' '%E{ID_VENDOR_ID}' '%E{ID_MODEL_ID}' '%E{ID_SERIAL_SHORT}'"

@@ -1,18 +1,22 @@
 import network
 import socket
 import time
+import json
 from machine import UART, Pin
 
-# Network credentials
-WIFI_SSID = 'your_wifi_ssid'
-WIFI_PASSWORD = 'your_wifi_password'
+def read_config():
+    with open('config.json', 'r') as f:
+        return json.load(f)
 
-# Server details
-IP_ADDRESS = 'your_device_ip_address'
-TCP_PORT = 50000
+# Load network credentials from config file
+config = read_config()
 
-# Pico identification number
-PICO_ID = 1  
+# Update Network and Server details
+WIFI_SSID 	  = config['WIFI_SSID']
+WIFI_PASSWORD = config['WIFI_PASSWORD']
+IP_ADDRESS    = config['IP_ADDRESS']
+TCP_PORT      = config['PORT']
+PICO_ID       = config['PICO_ID']
 
 # Initialize UART and LED
 uart1 = UART(1, 19200)

@@ -19,7 +19,7 @@ if [ ! -d "remote-serial-pico" ] || [ -z "$(ls -A remote-serial-pico)" ]; then
 else 
   echo "Directory remote-serial-pico already exists and is not empty. Skipping clone."; 
 fi && 
-cd /home/project/remote-serial-pico/src && 
+cd /home/project/remote-serial-pico/src/pi && 
 sudo cp 99-pico.rules /etc/udev/rules.d/ && 
 sudo udevadm control --reload-rules && 
 sudo udevadm trigger
@@ -36,4 +36,4 @@ runCommands(npmInstallCommand);
 console.log("Setting up remote-serial-pico project...");
 runCommands(setupProjectCommands);
 console.log("Starting the project...");
-execSync('node PtyServer.js', { stdio: 'inherit', cwd: '/home/project/remote-serial-pico/src', shell: true });
+execSync('node PtyServer.js', { stdio: 'inherit', cwd: '/home/project/remote-serial-pico/src/pi', shell: true });

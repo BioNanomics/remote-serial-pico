@@ -2,5 +2,6 @@
     "WIFI_SSID": "enter your wifi ssid",
     "WIFI_PASSWORD": "enter the wifi password",
     "IP_ADDRESS": "enter the Raspberry-Pi ip address",
+    "PORT": 50000,
     "PICO_ID": "1"
 }
