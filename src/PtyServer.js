@@ -1,4 +1,3 @@
-// Import required modules
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
@@ -7,207 +6,160 @@ const moment = require('moment-timezone');
 const PIPE_DIR = '/tmp'; // Directory where named pipes will be stored
 const TCP_PORT = 50000; // TCP port for the server to listen on
 const RESPONSE_SUFFIX = '_response'; // Suffix for response pipes
-const DEBOUNCE_TIME = 200; // Time in milliseconds to debounce pipe changes
 
 let serialIdToPicoNumber = {}; // Maps Pico serial IDs to Pico numbers
 let nextPicoNumber = 1; // Tracks the next Pico number to assign
-let picoSockets = {}; // Store sockets for each Pico-W, keyed by pico number
-let picoPipes = {}; // Store command pipe paths for each Pico-W
-let picoResponsePipes = {}; // Store response pipe paths for each Pico-W
-let fileWatchers = {}; // Store file watchers for command pipes
-let debounceTimers = {}; // Store debounce timers for each Pico
+let picoDevices = {}; // Combined object for storing device connections and pipe paths
+const DEBOUNCE_TIME = 20; // Time in milliseconds to debounce pipe changes
 
-// Create a writable stream to log commands and responses
+// Log file setup
 const LOG_FILE_PATH = '/tmp/smart_home.log';
 const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB in bytes
 
-function createLogFile() {
-    try {
-        fs.accessSync(LOG_FILE_PATH, fs.constants.F_OK);
-    } catch (err) {
-        try {
-            fs.writeFileSync(LOG_FILE_PATH, '');
-        } catch (err) {
-            console.error('Error creating log file:', err);
-        }
-    }
-}
-
+// Function to Log a message to the log file.
 function logMessage(message) {
-    try {
-        const stats = fs.statSync(LOG_FILE_PATH);
-        const fileSize = stats.size;
-
-        if (fileSize > MAX_FILE_SIZE_BYTES) {
-            fs.writeFileSync(LOG_FILE_PATH, ''); // Empty the file if it exceeds the limit
+    // Ensures the log file exists; creates it if it doesn't.
+    if (!fs.existsSync(LOG_FILE_PATH)) {
+        fs.writeFileSync(LOG_FILE_PATH, '');
+    } else {
+        // Check the file size and clear if it exceeds the maximum size
+        const fileSizeInBytes = fs.statSync(LOG_FILE_PATH).size;
+        if (fileSizeInBytes > MAX_FILE_SIZE_BYTES) {
+            fs.writeFileSync(LOG_FILE_PATH, '');
         }
-    } catch (err) {
-        console.error('Error accessing log file:', err);
     }
-
-    const logStream = fs.createWriteStream(LOG_FILE_PATH, { flags: 'a' });
-    logStream.write(`${getCurrentDateTimeInEST()} ${message}\n`);
-    logStream.end();
-}
-
-function getCurrentDateTimeInEST() {
-    return moment().tz('America/New_York').format('YYYY-MM-DD HH:mm:ss.S');
-}
-
-createLogFile();
-
-function sanitizeInput(input) {
-    // Remove null bytes and other non-printable characters
-    return String(input).replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+    // Append the new log message
+    const CurrentDateTimeInEST = moment().tz('America/New_York').format('YYYY-MM-DD HH:mm:ss:S');
+    const formattedMessage = `${CurrentDateTimeInEST} ${message}\n`;
+    fs.appendFileSync(LOG_FILE_PATH, formattedMessage);
 }
 
 // Setup command and response pipes for a given Pico-W
 function setupPipeForPico(picoNumber) {
-  const sanitizedNumber = sanitizeInput(picoNumber);
-  const commandPipeName = `pico_${sanitizedNumber}.txt`; // Generate name for command pipe
-  const commandPipePath = path.join(PIPE_DIR, commandPipeName); // Construct full pipe path
-  fs.writeFileSync(commandPipePath, '', { flag: 'w' }); // Create named pipe
-  fs.chmodSync(commandPipePath, 0o666); //Give read/write permission to the command pipe for all users  
-  picoPipes[picoNumber] = commandPipePath; // Store pipe path in the dictionary
+    const commandPipeName = `pico_${picoNumber}.txt`;
+    const commandPipePath = path.join(PIPE_DIR, commandPipeName);
+    fs.writeFileSync(commandPipePath, '', { flag: 'w' });
+    fs.chmodSync(commandPipePath, 0o666);
 
-  const responsePipeName = `pico_${sanitizedNumber}${RESPONSE_SUFFIX}.txt`;
-  const responsePipePath = path.join(PIPE_DIR, responsePipeName);
-  fs.writeFileSync(responsePipePath, '', { flag: 'w' });
-  fs.chmodSync(responsePipePath, 0o666);
-  picoResponsePipes[picoNumber] = responsePipePath;
+    const responsePipeName = `pico_${picoNumber}${RESPONSE_SUFFIX}.txt`;
+    const responsePipePath = path.join(PIPE_DIR, responsePipeName);
+    fs.writeFileSync(responsePipePath, '', { flag: 'w' });
+    fs.chmodSync(responsePipePath, 0o666);
 
-  console.log(`Pipes for Pico ${picoNumber} setup: Command [${commandPipePath}], Response [${responsePipePath}]`);
+    // Initialize or update the picoDevices entry
+    if (!picoDevices[picoNumber]) {
+        picoDevices[picoNumber] = {};
+    }
+    picoDevices[picoNumber].commandPipePath = commandPipePath;
+    picoDevices[picoNumber].responsePipePath = responsePipePath;
 
-  // Cancel any previous watcher and setup a new one
-  if (fileWatchers[picoNumber]) {
-      fileWatchers[picoNumber].close();
-  }
-
-  fileWatchers[picoNumber] = fs.watch(commandPipePath, (eventType, filename) => {
-      if (eventType === 'change') {
-          if (debounceTimers[picoNumber]) {
-              clearTimeout(debounceTimers[picoNumber]);
-          }
-          debounceTimers[picoNumber] = setTimeout(() => {
-              fs.readFile(commandPipePath, 'utf8', (err, data) => {
-                  if (err) {
-                      console.error(`Error reading command pipe for Pico ${picoNumber}:`, err);
-                      return;
-                  }
-                  if (data && picoSockets[picoNumber]) {
-                      picoSockets[picoNumber].write(data);
-                      fs.writeFileSync(commandPipePath, '', { flag: 'w' });
-                      logMessage(`[Pico ${picoNumber} - command] ${data.toString().trim()}`);
+    // Setup file watcher and debounce mechanism
+    if (picoDevices[picoNumber].fileWatcher) {
+        picoDevices[picoNumber].fileWatcher.close();
+    }
+    picoDevices[picoNumber].fileWatcher = fs.watch(commandPipePath, (eventType, filename) => {
+        if (eventType === 'change') {
+            if (picoDevices[picoNumber].debounceTimer) {
+                clearTimeout(picoDevices[picoNumber].debounceTimer);
+            }
+            picoDevices[picoNumber].debounceTimer = setTimeout(() => {
+                fs.readFile(commandPipePath, 'utf8', (err, data) => {
+                    if (err) {
+                        console.error(`Error reading command pipe for Pico ${picoNumber}:`, err);
+                        return;
                     }
-              });
-          }, DEBOUNCE_TIME);
-      }
-  });
+                    if (data && picoDevices[picoNumber].socket) {
+                        picoDevices[picoNumber].socket.write(data);
+                        fs.writeFileSync(commandPipePath, '', { flag: 'w' }); // Clear the file after reading
+                        logMessage(`[Pico ${picoNumber} - command] ${data.trim()}`);
+                    }
+                });
+            }, DEBOUNCE_TIME);
+        }
+    });
+    console.log(`Pipes for Pico ${picoNumber} setup: Command [${commandPipePath}], Response [${responsePipePath}]`);
 }
 
-// Write Pico-W response to a pipe
+// Function to handle Pico-W connection and store its socket
+function handlePicoConnection(picoNumber, socket) {
+    if (picoDevices[picoNumber] && picoDevices[picoNumber].socket) {
+        console.log(`Pico-W client ${picoNumber} reconnected.`);
+        picoDevices[picoNumber].socket.destroy(); // Prevent memory leaks
+    } else {
+        console.log(`Pico-W client ${picoNumber} connected.`);
+        setupPipeForPico(picoNumber);
+    }
+    picoDevices[picoNumber].socket = socket;
+}
+
+// Write Pico-W response to the response pipe
 function writeResponseToPipe(picoNumber, data) {
-    const responsePipePath = picoResponsePipes[picoNumber];
+    const responsePipePath = picoDevices[picoNumber].responsePipePath;
     if (responsePipePath) {
         fs.writeFileSync(responsePipePath, data);
         logMessage(`[Pico ${picoNumber} - response] ${data.toString().trim()}`);
     }
 }
 
-// Cleanup and delete pipes for a disconnected Pico-W
+// Cleanup function for deleting pipes and clearing resources for a disconnected Pico-W
 function clearAndDeletePipes(picoNumber) {
-    if (fileWatchers[picoNumber]) {
-        fileWatchers[picoNumber].close();
-        delete fileWatchers[picoNumber];
+    if (picoDevices[picoNumber]) {
+        if (picoDevices[picoNumber].commandPipePath) {
+            fs.unlinkSync(picoDevices[picoNumber].commandPipePath);
+        }
+        if (picoDevices[picoNumber].responsePipePath) {
+            fs.unlinkSync(picoDevices[picoNumber].responsePipePath);
+        }
+        console.log(`Pipes for Pico ${picoNumber} deleted.`);
+        delete picoDevices[picoNumber];
     }
-
-    if (picoPipes[picoNumber]) {
-        fs.unlinkSync(picoPipes[picoNumber]);
-        delete picoPipes[picoNumber];
-    }
-
-    if (picoResponsePipes[picoNumber]) {
-        fs.unlinkSync(picoResponsePipes[picoNumber]);
-        delete picoResponsePipes[picoNumber];
-    }
-
-    console.log(`Pipes for Pico ${picoNumber} deleted.`);
 }
 
-// Create TCP server
+// Create the TCP server and setup event listeners for socket connections
 const server = net.createServer((socket) => {
     let picoNumber = null;
-
     socket.on('data', (data) => {
-    const message = data.toString().trim();
-    const sanitizedMessage = sanitizeInput(message);
+        const message = data.toString().trim();
+        const sanitizedMessage = message;
 
-    // Check if the message is an identifier
-    if (sanitizedMessage.startsWith('pico_')) {
-        const serialId = sanitizedMessage.slice(5); // Extract Pico serial ID from the identifier
-        // Assign a new Pico number if this is a new serial ID
-        if (!serialIdToPicoNumber[serialId]) {
-            serialIdToPicoNumber[serialId] = nextPicoNumber++;
-        }
-        // Use the mapped Pico number for connection handling
-        picoNumber = serialIdToPicoNumber[serialId];
-        handlePicoConnection(picoNumber.toString(), socket); 
-    } else if (picoNumber) {
-        // If we have a picoNumber, it means this is data from the Pico
-        writeResponseToPipe(picoNumber.toString(), data);
-    }
-  });
-
-  socket.on('close', () => {
-    if (picoNumber) {
-        // Delay the cleanup to check if the socket reconnects
-        setTimeout(() => {
-            // Check if the socket for the picoNumber has been reassigned (indicating a reconnection)
-            // or if it's truly disconnected before cleanup.
-            if (!picoSockets[picoNumber] || picoSockets[picoNumber].destroyed) {
-                console.log(`Pico-W client ${picoNumber} disconnected.`);
-                clearAndDeletePipes(picoNumber);
-                delete picoSockets[picoNumber];
+        if (sanitizedMessage.startsWith('pico_')) {
+            const serialId = sanitizedMessage.slice(5);
+            if (!serialIdToPicoNumber[serialId]) {
+                serialIdToPicoNumber[serialId] = nextPicoNumber++;
             }
-        }, 100); // 100ms delay
-    }
+            picoNumber = serialIdToPicoNumber[serialId];
+            handlePicoConnection(picoNumber.toString(), socket);
+        } else if (picoNumber) {
+            writeResponseToPipe(picoNumber.toString(), data);
+        }
+    });
+
+    socket.on('close', () => {
+        if (picoNumber) {
+            setTimeout(() => {
+                if (!picoDevices[picoNumber] || picoDevices[picoNumber].socket.destroyed) {
+                    console.log(`Pico-W client ${picoNumber} disconnected.`);
+                    clearAndDeletePipes(picoNumber);
+                    delete picoDevices[picoNumber].socket;
+                }
+            }, 100); // Delay to allow for reconnection checks
+        }
+    });
+
+    socket.on('error', (err) => {
+        console.error('Socket error:', err);
+    });
 });
 
-  socket.on('error', (err) => {
-      console.error('Socket error:', err);
-  });
-});
-
-// To handle Pico-W connection
-function handlePicoConnection(picoNumber, socket) {
-  if (picoSockets[picoNumber]) {
-      console.log(`Pico-W client ${picoNumber} reconnected.`);
-      // Close the old socket before reassigning it to prevent memory leaks
-      picoSockets[picoNumber].destroy();
-  } else {
-      console.log(`Pico-W client ${picoNumber} connected.`);
-      setupPipeForPico(picoNumber);
-  }
-  // Store the socket for the Pico-W
-  picoSockets[picoNumber] = socket;
-}
-
-// Start listening on the specified TCP port
 server.listen(TCP_PORT, () => {
     console.log(`Server listening on TCP port ${TCP_PORT}`);
 });
 
-// clean up resources and exit cleanly on process termination signals
+// Function to clean up resources and exit cleanly on process termination signals
 function cleanUp() {
-    Object.keys(picoSockets).forEach((picoNumber) => {
-        if (picoSockets[picoNumber]) {
-            picoSockets[picoNumber].end();
-            delete picoSockets[picoNumber];
-        }
-        clearAndDeletePipes(picoNumber); // Ensure cleanup includes file watchers
+    Object.keys(picoDevices).forEach((picoNumber) => {
+        clearAndDeletePipes(picoNumber);
     });
     process.exit(0); // Exit cleanly
 }
-
-// Register cleanup function for SIGINT and SIGTERM signals
 process.on('SIGINT', cleanUp).on('SIGTERM', cleanUp);
