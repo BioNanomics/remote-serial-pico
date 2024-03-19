@@ -36,6 +36,10 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Sends data available in command pipe to the respective Pico and clears the pipe.
     * Writes data received from Pico into corresponding response pipe.
     * Deletes corresponding Pico pipes upon disconnection.
+    * Log the commands and responses for each pico; check out the log:
+        ```
+        tail -f /tmp/smart_home.log
+        ```
 
 * **Wondering how plugging Pico into the Pi installs client code in Pico?**
     * The udev rule ([99-pico.rules](./src/99-pico.rules)) watches Pi's USB port for Pico connection.
@@ -53,10 +57,6 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Retrieves the network credentials and server details from the `config.json`.
     * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
     * Continuously checks for data in TCP or Serial; if it receives data from either, it sends that data to the other. 
-    * You can checkout the commands and responses log:
-        ```
-        tail -f /tmp/smart_home.log
-        ```
 
 ## Visual Overview
 * Checkout [detailed diagram](img/2.jpg).

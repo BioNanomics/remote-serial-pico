@@ -6,11 +6,11 @@ const moment = require('moment-timezone');
 const PIPE_DIR = '/tmp'; // Directory where named pipes will be stored
 const TCP_PORT = 50000; // TCP port for the server to listen on
 const RESPONSE_SUFFIX = '_response'; // Suffix for response pipes
+const DEBOUNCE_TIME = 20; // Time in milliseconds to debounce pipe changes
 
 let serialIdToPicoNumber = {}; // Maps Pico serial IDs to Pico numbers
 let nextPicoNumber = 1; // Tracks the next Pico number to assign
-let picoDevices = {}; // Combined object for storing device connections and pipe paths
-const DEBOUNCE_TIME = 20; // Time in milliseconds to debounce pipe changes
+let picoDevices = {}; // storing device connections and pipe paths
 
 // Log file setup
 const LOG_FILE_PATH = '/tmp/smart_home.log';
@@ -35,7 +35,7 @@ function logMessage(message) {
 }
 
 // Setup command and response pipes for a given Pico-W
-function setupPipeForPico(picoNumber) {
+function setupPicoPipes(picoNumber) {
     const commandPipeName = `pico_${picoNumber}.txt`;
     const commandPipePath = path.join(PIPE_DIR, commandPipeName);
     fs.writeFileSync(commandPipePath, '', { flag: 'w' });
@@ -57,6 +57,12 @@ function setupPipeForPico(picoNumber) {
     if (picoDevices[picoNumber].fileWatcher) {
         picoDevices[picoNumber].fileWatcher.close();
     }
+
+    setupFileWatcher(picoNumber, commandPipePath);
+    console.log(`Pico ${picoNumber}: Command Pipe [${commandPipePath}], Response Pipe [${responsePipePath}]`);
+}
+
+function setupFileWatcher(picoNumber, commandPipePath) {
     picoDevices[picoNumber].fileWatcher = fs.watch(commandPipePath, (eventType, filename) => {
         if (eventType === 'change') {
             if (picoDevices[picoNumber].debounceTimer) {
@@ -77,7 +83,6 @@ function setupPipeForPico(picoNumber) {
             }, DEBOUNCE_TIME);
         }
     });
-    console.log(`Pipes for Pico ${picoNumber} setup: Command [${commandPipePath}], Response [${responsePipePath}]`);
 }
 
 // Function to handle Pico-W connection and store its socket
@@ -87,7 +92,7 @@ function handlePicoConnection(picoNumber, socket) {
         picoDevices[picoNumber].socket.destroy(); // Prevent memory leaks
     } else {
         console.log(`Pico-W client ${picoNumber} connected.`);
-        setupPipeForPico(picoNumber);
+        setupPicoPipes(picoNumber);
     }
     picoDevices[picoNumber].socket = socket;
 }
@@ -103,15 +108,24 @@ function writeResponseToPipe(picoNumber, data) {
 
 // Cleanup function for deleting pipes and clearing resources for a disconnected Pico-W
 function clearAndDeletePipes(picoNumber) {
-    if (picoDevices[picoNumber]) {
-        if (picoDevices[picoNumber].commandPipePath) {
-            fs.unlinkSync(picoDevices[picoNumber].commandPipePath);
+    const picoDevice = picoDevices[picoNumber];
+    if (picoDevice) {
+        if (picoDevice.fileWatcher) {
+            picoDevice.fileWatcher.close();
         }
-        if (picoDevices[picoNumber].responsePipePath) {
-            fs.unlinkSync(picoDevices[picoNumber].responsePipePath);
+        if (picoDevice.commandPipePath) {
+            fs.unlinkSync(picoDevice.commandPipePath);
         }
-        console.log(`Pipes for Pico ${picoNumber} deleted.`);
+        if (picoDevice.responsePipePath) {
+            fs.unlinkSync(picoDevice.responsePipePath);
+        }
+        if (picoDevice.socket && !picoDevice.socket.destroyed) {
+            picoDevice.socket.destroy();
+        }
         delete picoDevices[picoNumber];
+        console.log(`Pipes for Pico ${picoNumber} deleted.`);
+    } else {
+        console.log(`No pipes found for Pico ${picoNumber}.`);
     }
 }
 
@@ -137,10 +151,9 @@ const server = net.createServer((socket) => {
     socket.on('close', () => {
         if (picoNumber) {
             setTimeout(() => {
-                if (!picoDevices[picoNumber] || picoDevices[picoNumber].socket.destroyed) {
+                if (picoDevices[picoNumber] && (!picoDevices[picoNumber].socket || picoDevices[picoNumber].socket.destroyed)) {
                     console.log(`Pico-W client ${picoNumber} disconnected.`);
                     clearAndDeletePipes(picoNumber);
-                    delete picoDevices[picoNumber].socket;
                 }
             }, 100); // Delay to allow for reconnection checks
         }
