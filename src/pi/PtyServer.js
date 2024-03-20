@@ -2,6 +2,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const moment = require('moment-timezone');
+const pty = require('node-pty');
 
 const PIPE_DIR = '/tmp'; // Directory where named pipes will be stored
 const TCP_PORT = 50000; // TCP port for the server to listen on
@@ -32,6 +33,18 @@ function logMessage(message) {
     const CurrentDateTimeInEST = moment().tz('America/New_York').format('YYYY-MM-DD HH:mm:ss:S');
     const formattedMessage = `${CurrentDateTimeInEST} ${message}\n`;
     fs.appendFileSync(LOG_FILE_PATH, formattedMessage);
+}
+
+// See https://gist.github.com/horner/d3d41ec3ce0f773c33a2652540fc2646
+function setupPtyforPico() {
+    const myPty = pty.open();
+    console.log("Made virtual tty:" + myPty.ptsName);
+    // Make a logical link to the tty with the pico number
+    picoResponsePipes[picoNumber] = myPty; // Store off the ptyy
+    myPty._master.on('data', (data) => {
+      // write this to the network
+      console.log(data.toString());
+    });
 }
 
 // Setup command and response pipes for a given Pico-W
