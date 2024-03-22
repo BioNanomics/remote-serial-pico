@@ -32,10 +32,10 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 ## Project Details
 * **Curious about PtyServer?**
-    * Detects Pico clients upon receiving first packet with `pico_{N}`, and assigns separate pipes for each Pico.
-    * Sends data available in command pipe to the respective Pico and clears the pipe.
-    * Writes data received from Pico into corresponding response pipe.
-    * Deletes corresponding Pico pipes upon disconnection.
+    * Detects Pico clients upon receiving first packet with `pico_{N}`, and creates a pseudo terminal(pty) for each Pico.
+    * Sends data available in pty to the respective Pico.
+    * Writes data received from Pico into corresponding pty.
+    * Deletes corresponding Pico pty upon disconnection.
     * Log the commands and responses for each pico; check out the log:
         ```
         tail -f /tmp/smart_home.log
