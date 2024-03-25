@@ -35,10 +35,9 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Detects Pico clients upon receiving first packet with `pico_{N}`, and creates a pseudo terminal(pty) for each Pico.
     * Sends data available in pty to the respective Pico.
     * Writes data received from Pico into corresponding pty.
-    * Deletes corresponding Pico pty upon disconnection.
     * Log the commands and responses for each pico; check out the log:
         ```
-        tail -f /tmp/smart_home.log
+        tail -f /tmp/smartHome.log
         ```
 
 * **Wondering how plugging Pico into the Pi installs client code in Pico?**
@@ -56,7 +55,7 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 * **Now, what's the role of the main code in Pico?**
     * Retrieves the network credentials and server details from the `config.json`.
     * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
-    * Continuously checks for data in TCP or Serial; if it receives data from either, it sends that data to the other. 
+    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other. 
 
 ## Visual Overview
 * Checkout [detailed diagram](img/2.jpg).

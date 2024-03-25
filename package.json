@@ -27,7 +27,10 @@
   "author": "Rajkumar Gara",
   "license": "ISC",
   "dependencies": {
-    "moment-timezone": "^0.5.45"
+    "moment-timezone": "^0.5.45",
+    "node-pty": "^1.0.0",
+    "winston": "^3.12.0",
+    "winston-syslog": "^2.7.0"
   },
   "bugs": {
     "url": "https://github.com/RajkumarGara/remote-serial-pico/issues"

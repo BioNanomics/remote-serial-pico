@@ -1,7 +1,9 @@
 const net = require('net');
-const moment = require('moment-timezone');
 const pty = require('node-pty');
 const fs = require('fs');
+const { createLogger, format, transports } = require('winston');
+const { combine, timestamp, printf } = format;
+const { Syslog } = require('winston-syslog');
 
 const TCP_PORT = 50000; // TCP port for the server to listen on
 const symlinkDir = '/home/project'; // Directory for symlinks
@@ -10,27 +12,45 @@ let serialIdToPicoNumber = {}; // Maps Pico serial IDs to Pico numbers
 let nextPicoNumber = 1; // Tracks the next Pico number to assign
 let picoDevices = {}; // storing device connections and pty processes
 
-// Log file setup
-const LOG_FILE_PATH = '/tmp/smart_home.log';
-const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB in bytes
-
-// Function to Log a message to the log file.
-function logMessage(message) {
-    // Ensures the log file exists; creates it if it doesn't.
-    if (!fs.existsSync(LOG_FILE_PATH)) {
-        fs.writeFileSync(LOG_FILE_PATH, '');
-    } else {
-        // Check the file size and clear if it exceeds the maximum size
-        const fileSizeInBytes = fs.statSync(LOG_FILE_PATH).size;
-        if (fileSizeInBytes > MAX_FILE_SIZE_BYTES) {
-            fs.writeFileSync(LOG_FILE_PATH, '');
+// Combined custom format for timestamp and log message
+const customFormat = combine(
+    timestamp({
+        format: () => {
+            const now = new Date();
+            const month = now.toLocaleString('default', { month: 'short' });
+            const day = now.getDate();
+            const time = now.toLocaleTimeString([], { hour12: false });
+            return `${month} ${day} ${time}`;
         }
-    }
-    // Append the new log message
-    const CurrentDateTimeInEST = moment().tz('America/New_York').format('YYYY-MM-DD HH:mm:ss:S');
-    const formattedMessage = `${CurrentDateTimeInEST} ${message}\n`;
-    fs.appendFileSync(LOG_FILE_PATH, formattedMessage);
-}
+    }),
+    printf(({ timestamp, message }) => {
+        return `${timestamp} ${message}`;
+    })
+);
+
+const syslogTransport = new Syslog({
+    protocol: 'unix',
+    path: '/dev/log',
+    format: printf(({ message }) => message) // Log only the message
+});
+
+const consoleTransport = new transports.Console({
+    format: customFormat
+});
+
+const fileTransport = new transports.File({ 
+    filename: '/tmp/smartHome.log',
+    format: customFormat
+});
+
+// Create a logger instance
+const logger = createLogger({
+    transports: [
+        // syslogTransport,  // Log to syslog (systemd journal)
+        // consoleTransport, // Log to console
+        fileTransport     // Log to a file
+    ]
+});
 
 // Function to create symlink for Pico
 function createSymlink(picoNumber, ptsName) {
@@ -38,12 +58,12 @@ function createSymlink(picoNumber, ptsName) {
     if (!fs.existsSync(symlinkPath)) {
         try {
             fs.symlinkSync(ptsName, symlinkPath);
-            logMessage(`Created symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}'`);
+            logger.info(`Created symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}'`);
         } catch (err) {
-            logMessage(`Error creating symlink: ${err.message}`);
+            logger.error(`Error creating symlink: ${err.message}`);
         }
     } else {
-        logMessage(`Symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}' already exists.`);
+        logger.info(`Symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}' already exists`);
     }
 }
 
@@ -52,32 +72,33 @@ function removeSymlink(picoNumber) {
     const symlinkPath = `${symlinkDir}/pico${picoNumber}`;
     try {
         fs.unlinkSync(symlinkPath);
-        logMessage(`Removed symlink pico${picoNumber}`);
+        logger.info(`Pico${picoNumber} symlink removed`);
     } catch (err) {
-        logMessage(`Error removing symlink: ${err.message}`);
+        logger.error(`Error removing symlink: ${err.message}`);
     }
 }
 
-// Setup pty for a given Pico-W
+// Function to handle Pico connection and store its socket and pty process
+function handlePicoConnection(picoNumber, socket) {
+    if (picoDevices[picoNumber] && picoDevices[picoNumber].socket) {
+        logger.warn(`Pico${picoNumber} client reconnected`);
+        picoDevices[picoNumber].socket.destroy(); // Prevent memory leaks
+    } else {
+        logger.info(`Pico${picoNumber} client connected`);
+        setupPicoPty(picoNumber);
+    }
+    picoDevices[picoNumber].socket = socket;
+}
+
+// Setup pty for a given Pico
 function setupPicoPty(picoNumber) {
+    if (!picoDevices[picoNumber]) {
+        picoDevices[picoNumber] = {}; // Initialize as an object if it doesn't exist
+    }
     const myPty = pty.open();
     createSymlink(picoNumber, myPty.ptsName);
-    return myPty;
-}
-
-// Function to handle Pico-W connection and store its socket and pty process
-function handlePicoConnection(picoNumber, socket) {
-    if (picoDevices[picoNumber] && picoDevices[picoNumber].pty) {
-        logMessage(`Pico${picoNumber} client reconnected.`);
-    } else {
-        logMessage(`Pico${picoNumber} client connected.`);
-        const myPty = setupPicoPty(picoNumber);
-        picoDevices[picoNumber] = {
-            socket: socket,
-            pty: myPty
-        };
-        routePtyCmdToSocket(picoNumber);
-    }
+    picoDevices[picoNumber].pty = myPty;
+    routePtyCmdToSocket(picoNumber);
 }
 
 // Function to handle data received from pty and send it to the socket
@@ -86,7 +107,7 @@ function routePtyCmdToSocket(picoNumber) {
     myPty.on('data', (data) => {
         const command = data.toString();
         picoDevices[picoNumber].socket.write(command);
-        logMessage(`[Pico ${picoNumber} - command] ${command}`);
+        logger.info(`Pico${picoNumber} command  ${command}`);
     });
 }
 
@@ -94,7 +115,7 @@ function routePtyCmdToSocket(picoNumber) {
 function writePicoRespToPty(picoNumber, response) {
     const myPty = picoDevices[picoNumber].pty;
     myPty.write(response + '\r');
-    logMessage(`[Pico ${picoNumber} - response] ${response}`);
+    logger.info(`Pico${picoNumber} response ${response}`);
 }
 
 // Create the TCP server and setup event listeners for socket connections
@@ -118,31 +139,43 @@ const server = net.createServer((socket) => {
     });
 
     socket.on('close', () => {
-        if (picoNumber && picoDevices[picoNumber]) {
-            logMessage(`Pico${picoNumber} client disconnected.`);
-            picoDevices[picoNumber].pty.destroy();
-            removeSymlink(picoNumber);
-            delete picoDevices[picoNumber];
+        if (picoNumber) {
+            logger.warn(`Pico${picoNumber} client disconnected`);
         }
     });
 
     socket.on('error', (err) => {
-        logMessage('Socket error:', err);
+        logger.error('Socket error:', err);
     });
 });
 
 server.listen(TCP_PORT, () => {
-    logMessage(`Server listening on TCP port ${TCP_PORT}`);
+    logger.info(`Server listening on TCP port ${TCP_PORT}`);
 });
 
-// Function to clean up resources and exit cleanly on process termination signals
-function cleanUp() {
-    Object.keys(picoDevices).forEach((picoNumber) => {
-        if (picoDevices[picoNumber] && picoDevices[picoNumber].pty) {
-            picoDevices[picoNumber].pty.destroy();
+// Cleanup function for destroying pty, socket for a given pico
+function cleanPicoResources(picoNumber) {
+    const picoDevice = picoDevices[picoNumber];
+    if (picoDevice) {
+        if (picoDevice.pty) {
+            picoDevice.pty.destroy();
             removeSymlink(picoNumber);
         }
+        if (picoDevice.socket && !picoDevice.socket.destroyed) {
+            picoDevice.socket.destroy();
+        }
+        delete picoDevices[picoNumber];
+        logger.info(`Pico${picoNumber} pty and socket destroyed`);
+    } else {
+        logger.info(`Pico${picoNumber} device not found`);
+    }
+}
+
+// clean up all resources and exit gracefully on process termination signals
+function fullCleanUp() {
+    Object.keys(picoDevices).forEach((picoNumber) => {
+        cleanPicoResources(picoNumber);
     });
     process.exit(0);
 }
-process.on('SIGINT', cleanUp).on('SIGTERM', cleanUp);
+process.on('SIGINT', fullCleanUp).on('SIGTERM', fullCleanUp);
