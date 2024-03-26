@@ -140,7 +140,7 @@ const server = net.createServer((socket) => {
 
     socket.on('close', () => {
         if (picoNumber) {
-            logger.warn(`Pico${picoNumber} client disconnected`);
+            logger.warn(`Pico${picoNumber} socket close event triggered; ignored this event`);
         }
     });
 
