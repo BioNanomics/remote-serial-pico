@@ -60,8 +60,9 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other. 
 
 ## Visual Overview
-* Checkout [detailed diagram](img/2.jpg). [SRC](https://docs.google.com/document/d/16LFFmloh7tNBZP-OtcaIe8EgjfAc7IFV-q3neljFaFA/edit#heading=h.tsg0skd3kzjw)
-    ![block diagram](img/1.jpg)
+* Checkout the serial diagram: ![block diagram](img/2.jpg)  
+* Checkout the network diagram: [SRC](https://docs.google.com/drawings/d/1oIbP6EGNI4thhi0qzVgtGZw0lyD-F9gRc0-1tAc7O_Q/edit)
+    ![drawing alt text](https://docs.google.com/drawings/d/1oIbP6EGNI4thhi0qzVgtGZw0lyD-F9gRc0-1tAc7O_Q/export/png)
 
     [![Watch the video](img/4.GIF)](https://youtu.be/M36LoMouvPg)
 
