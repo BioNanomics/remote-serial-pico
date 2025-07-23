@@ -1,16 +1,28 @@
 const net = require('net');
 const pty = require('node-pty');
 const fs = require('fs');
+const yaml = require('js-yaml');
+const path = require('path');
+
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
 const { Syslog } = require('winston-syslog');
 
-const TCP_PORT = 50000; // TCP port for the server to listen on
-const symlinkDir = '/home/project'; // Directory for symlinks
+let serialIdToPicoName = {};  // Holds the mapping of serial IDs to Pico names
+let picoDevices = {};         // Tracks connected Pico devices and their sockets
+let lastPicoMappingFileTime = 0;  // Tracks last modified time of PicoSerialMap file
 
-let serialIdToPicoNumber = {}; // Maps Pico serial IDs to Pico numbers
-let nextPicoNumber = 1; // Tracks the next Pico number to assign
-let picoDevices = {}; // storing device connections and pty processes
+// Load configuration from config.yaml in the current working directory
+const configFilePath = path.join(__dirname, 'config.yaml');
+let config = {};
+
+try {
+    const fileContents = fs.readFileSync(configFilePath, 'utf8');
+    config = yaml.load(fileContents);
+} catch (err) {
+    console.error(`Failed to load config.yaml: ${err.message}`);
+    process.exit(1);
+}
 
 // Combined custom format for timestamp and log message
 const customFormat = combine(
@@ -30,7 +42,7 @@ const customFormat = combine(
 
 const syslogTransport = new Syslog({
     protocol: 'unix',
-    path: '/dev/log',
+    path: config.SyslogDir,
     format: printf(({ message }) => message) // Log only the message
 });
 
@@ -39,108 +51,165 @@ const consoleTransport = new transports.Console({
 });
 
 const fileTransport = new transports.File({ 
-    filename: '/tmp/smartHome.log',
+    filename: config.CustomlogDir,
     format: customFormat
 });
 
 // Create a logger instance
 const logger = createLogger({
     transports: [
-        // syslogTransport,  // Log to syslog (systemd journal)
-        // consoleTransport, // Log to console
+        syslogTransport,  // Log to syslog (systemd journal)
+        consoleTransport, // Log to console
         fileTransport     // Log to a file
     ]
 });
 
-// Function to create symlink for Pico
-function createSymlink(picoNumber, ptsName) {
-    const symlinkPath = `${symlinkDir}/pico${picoNumber}`;
-    if (!fs.existsSync(symlinkPath)) {
-        try {
-            fs.symlinkSync(ptsName, symlinkPath);
-            logger.info(`Created symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}'`);
-        } catch (err) {
-            logger.error(`Error creating symlink: ${err.message}`);
-        }
+// Function to handle Pico connection
+function handlePicoConnection(serialId, socket) {
+    // Load the latest PicoSerialMap file on each connection
+    loadPicoMappingFromFile();
+    const picoName = serialIdToPicoName[serialId] || serialId;
+
+    // If the serialId is not found, add it to the mapping
+    if (!serialIdToPicoName[serialId]) {
+        serialIdToPicoName[serialId] = picoName;
+        savePicoMappingToFile();
+    }
+
+    if (picoDevices[picoName] && picoDevices[picoName].socket) {
+        logger.warn(`${picoName} tcp client reconnected`);
+        picoDevices[picoName].socket.destroy();  // Prevent memory leaks
     } else {
-        logger.info(`Symlink '${fs.realpathSync(symlinkPath)}' -> '${symlinkPath}' already exists`);
+        logger.info(`${picoName} tcp client connected`);
+        setupPicoPty(picoName);
+    }
+    picoDevices[picoName] = { socket };
+    return picoName;
+}
+
+// Function to load the serialIdToPicoName mapping from the PicoSerialMap file
+function loadPicoMappingFromFile() {
+    const picoMappingFilePath = config.PicoSerialMap;
+    try {
+        const stats = fs.statSync(picoMappingFilePath); // Get file stats
+        const fileModifiedTime = stats.mtimeMs; // Get the last modified time in milliseconds
+
+        // Check if the file has been modified since the last load
+        if (fileModifiedTime > lastPicoMappingFileTime) {
+            const fileContents = fs.readFileSync(picoMappingFilePath, 'utf8');
+            const loadedMapping = yaml.load(fileContents);
+            Object.assign(serialIdToPicoName, loadedMapping); // Merge with the existing mapping
+
+            lastPicoMappingFileTime = fileModifiedTime;
+            logger.info(`Pico serial id -> name mapping loaded`);
+        }
+    } catch (err) {
+        logger.error(`Error loading Pico mapping: ${err.message}`);
+    }
+}
+
+// Function to save updated serialIdToPicoName map to the PicoSerialMap file
+function savePicoMappingToFile() {
+    const picoMappingFilePath = config.PicoSerialMap;
+
+    try {
+        const yamlData = yaml.dump(serialIdToPicoName);
+        fs.writeFileSync(picoMappingFilePath, yamlData, 'utf8');
+        logger.info(`Pico mapping saved to ${picoMappingFilePath}`);
+    } catch (err) {
+        logger.error(`Error saving Pico mapping: ${err.message}`);
+    }
+}
+
+// Setup pty for a given Pico
+function setupPicoPty(picoName) {
+    const myPty = pty.open();
+    createSymlink(picoName, myPty.ptsName);
+    
+    if (!picoDevices[picoName]) {
+        picoDevices[picoName] = {};
+    }
+    picoDevices[picoName].pty = myPty;
+    routePtyCmdToSocket(picoName);
+}
+
+// Function to set up PTY for the Pico
+function createSymlink(picoName, ptsName) {
+    const symlinkPath = `${config.symlinkDir}/${picoName}`;
+    try {
+        if (fs.existsSync(symlinkPath)) {
+            const currentTarget = fs.readlinkSync(symlinkPath);  // Check where the symlink points to
+            if (currentTarget !== ptsName) {
+                fs.unlinkSync(symlinkPath);  // Remove the old symlink if it's wrong
+                fs.symlinkSync(ptsName, symlinkPath);  // Create a new symlink
+                logger.info(`Updated symlink ${symlinkPath} -> ${ptsName}`);
+            } else {
+                logger.info(`Symlink ${symlinkPath} -> ${ptsName} already exists`);
+            }
+        } else {
+            fs.symlinkSync(ptsName, symlinkPath);  // Create the symlink if it doesn't exist
+            logger.info(`Created symlink ${symlinkPath} -> ${ptsName}`);
+        }
+    } catch (err) {
+        logger.error(`Error creating symlink: ${err.message}`);
     }
 }
 
 // Function to remove symlink for Pico
-function removeSymlink(picoNumber) {
-    const symlinkPath = `${symlinkDir}/pico${picoNumber}`;
+function removeSymlink(picoName) {
+    const symlinkPath = `${config.symlinkDir}/${picoName}`;
     try {
         fs.unlinkSync(symlinkPath);
-        logger.info(`Pico${picoNumber} symlink removed`);
+        logger.info(`${picoName} symlink removed`);
     } catch (err) {
         logger.error(`Error removing symlink: ${err.message}`);
     }
 }
 
-// Function to handle Pico connection and store its socket and pty process
-function handlePicoConnection(picoNumber, socket) {
-    if (picoDevices[picoNumber] && picoDevices[picoNumber].socket) {
-        logger.warn(`Pico${picoNumber} client reconnected`);
-        picoDevices[picoNumber].socket.destroy(); // Prevent memory leaks
-    } else {
-        logger.info(`Pico${picoNumber} client connected`);
-        setupPicoPty(picoNumber);
-    }
-    picoDevices[picoNumber].socket = socket;
-}
-
-// Setup pty for a given Pico
-function setupPicoPty(picoNumber) {
-    if (!picoDevices[picoNumber]) {
-        picoDevices[picoNumber] = {}; // Initialize as an object if it doesn't exist
-    }
-    const myPty = pty.open();
-    createSymlink(picoNumber, myPty.ptsName);
-    picoDevices[picoNumber].pty = myPty;
-    routePtyCmdToSocket(picoNumber);
-}
-
 // Function to handle data received from pty and send it to the socket
-function routePtyCmdToSocket(picoNumber) {
-    const myPty = picoDevices[picoNumber].pty;
+function routePtyCmdToSocket(picoName) {
+    const myPty = picoDevices[picoName].pty;
     myPty.on('data', (data) => {
         const command = data.toString();
-        picoDevices[picoNumber].socket.write(command);
-        logger.info(`Pico${picoNumber} command  ${command}`);
+        picoDevices[picoName].socket.write(command);
+        logger.info(`command to ${picoName}: ${command}`);
     });
 }
 
 // Function to write response received from socket to the pty
-function writePicoRespToPty(picoNumber, response) {
-    const myPty = picoDevices[picoNumber].pty;
-    myPty.write(response + '\r');
-    logger.info(`Pico${picoNumber} response ${response}`);
+function writePicoRespToPty(picoName, response) {
+    const myPty = picoDevices[picoName].pty;
+    if (myPty) {
+        myPty.write(response + '\r');
+        logger.info(`Response from ${picoName}: ${response}`);
+    }
 }
 
-// Create the TCP server and setup event listeners for socket connections
+// TCP server to listen for connections from Pico devices
 const server = net.createServer((socket) => {
-    let picoNumber = null;
+    let picoName = null;
 
     socket.on('data', (data) => {
         const message = data.toString().trim();
-        const sanitizedMessage = message;
 
-        if (sanitizedMessage.startsWith('pico_')) {
-            const serialId = sanitizedMessage.slice(5);
-            if (!serialIdToPicoNumber[serialId]) {
-                serialIdToPicoNumber[serialId] = nextPicoNumber++;
-            }
-            picoNumber = serialIdToPicoNumber[serialId];
-            handlePicoConnection(picoNumber.toString(), socket);
-        } else if (picoNumber) {
-            writePicoRespToPty(picoNumber, sanitizedMessage);
+        // 💓 Heartbeat: respond to PING with PONG
+        if (message === 'PING') {
+            socket.write('PONG\n');
+            logger.info(`Heartbeat received from ${picoName || 'unknown'} -> Responded with PONG`);
+            return;
+        }
+
+        if (message.startsWith('pico_')) {
+            const serialId = message.slice(5);
+            picoName = handlePicoConnection(serialId, socket);
+        } else if (picoName) {
+            writePicoRespToPty(picoName, message);
         }
     });
 
     socket.on('close', () => {
-        if (picoNumber) {
-            logger.warn(`Pico${picoNumber} socket close event triggered; ignored this event`);
+        if (picoName) {
+            logger.warn(`${picoName} socket close event triggered; ignored this event`);
         }
     });
 
@@ -149,33 +218,34 @@ const server = net.createServer((socket) => {
     });
 });
 
-server.listen(TCP_PORT, () => {
-    logger.info(`Server listening on TCP port ${TCP_PORT}`);
+server.listen(config.TCP_PORT, () => {
+    logger.info(`Server listening on TCP port ${config.TCP_PORT}`);
 });
 
-// Cleanup function for destroying pty, socket for a given pico
-function cleanPicoResources(picoNumber) {
-    const picoDevice = picoDevices[picoNumber];
+// Cleanup function for destroying pty and socket for a given pico
+function cleanPicoResources(picoName) {
+    const picoDevice = picoDevices[picoName];
     if (picoDevice) {
+        removeSymlink(picoName);
         if (picoDevice.pty) {
             picoDevice.pty.destroy();
-            removeSymlink(picoNumber);
         }
         if (picoDevice.socket && !picoDevice.socket.destroyed) {
             picoDevice.socket.destroy();
         }
-        delete picoDevices[picoNumber];
-        logger.info(`Pico${picoNumber} pty and socket destroyed`);
+        delete picoDevices[picoName];
+        logger.info(`${picoName} pty and socket destroyed`);
     } else {
-        logger.info(`Pico${picoNumber} device not found`);
+        logger.info(`${picoName} device not found (pty and socket not destroyed)`);
     }
 }
 
-// clean up all resources and exit gracefully on process termination signals
+// Clean up all resources and exit gracefully on process termination signals
 function fullCleanUp() {
-    Object.keys(picoDevices).forEach((picoNumber) => {
-        cleanPicoResources(picoNumber);
+    Object.keys(picoDevices).forEach((picoName) => {
+        cleanPicoResources(picoName);
     });
     process.exit(0);
 }
+
 process.on('SIGINT', fullCleanUp).on('SIGTERM', fullCleanUp);

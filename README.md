@@ -57,7 +57,22 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 * **Now, what's the role of the main code in Pico?**
     * Retrieves the network credentials and server details from the `config.json`.
     * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
-    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other. 
+    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other.
+    * Sends a heartbeat signal (`PING`) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` response from the server.
+
+## Managing the PtyServer Service
+
+If you need to restart the PtyServer service (for example, after updating code or configuration), use:
+
+```
+sudo systemctl restart ptyserver.service
+```
+
+To view the live log output for the service:
+
+```
+sudo journalctl -u ptyserver.service -f
+```
 
 ## Visual Overview
 * Checkout the serial diagram: ![block diagram](img/2.jpg)  

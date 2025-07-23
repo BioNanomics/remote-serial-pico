@@ -4,21 +4,19 @@ import time
 import json
 from machine import UART, Pin
 
+# Load network configuration
 def read_config():
     with open('config.json', 'r') as f:
         return json.load(f)
 
-# Load network credentials from config file
 config = read_config()
-
-# Update Network and Server details
-WIFI_SSID 	  = config['WIFI_SSID']
+WIFI_SSID     = config['WIFI_SSID']
 WIFI_PASSWORD = config['WIFI_PASSWORD']
 IP_ADDRESS    = config['IP_ADDRESS']
 TCP_PORT      = config['PORT']
 PICO_ID       = config['PICO_ID']
 
-# Initialize UART and LED
+# Initialize UART and onboard LED
 uart1 = UART(1, 19200)
 uart1.init(19200, bits=8, parity=None, stop=1, tx=4, rx=5)
 led = Pin("LED", Pin.OUT)
@@ -32,80 +30,120 @@ def blink_led():
 # Connect to Wi-Fi
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
+print(f"[WiFi] Connecting to SSID: {WIFI_SSID}")
 wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-
+wifi_attempts = 0
 while not wlan.isconnected():
     blink_led()
-
+    wifi_attempts += 1
+    print(f"[WiFi] Waiting for connection... attempt {wifi_attempts}")
+print(f"[WiFi] Connected! IP: {wlan.ifconfig()[0]}")
 led.off()
-print("Connected to WiFi")
 
-# Establish a new TCP connection
+# Establish TCP connection to server
 def create_tcp_connection():
+    attempt = 1
     while True:
         try:
+            print(f"[TCP] Connecting to {IP_ADDRESS}:{TCP_PORT} (attempt {attempt})")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
             sock.connect((IP_ADDRESS, TCP_PORT))
+            sock.settimeout(None)
             led.on()
+            print("[TCP] Connected successfully")
             return sock
-        
         except Exception as e:
-            print(f"Failed to connect to TCP server: {e}")
-            print("Retrying in 5 seconds...")
+            print(f"[TCP] Connection failed: {e}")
+            try: sock.close()
+            except: pass
+            print("[TCP] Retrying in 5 seconds...")
             time.sleep(5)
+            attempt += 1
 
-# 'pico_ID' packet to initiate named pipe creation
+# Send hello identification message
 def send_hello_packet(sock):
-    hello_message = f'pico_{PICO_ID}'
-    sock.send(hello_message.encode())
+    msg = f'pico_{PICO_ID}'
+    print(f"[TCP] Sending hello: {msg}")
+    sock.send(msg.encode())
 
-# Create initial TCP socket and connect
-s = create_tcp_connection()
-print("Connected to TCP server")
+HEARTBEAT_INTERVAL = 10  # seconds
+last_heartbeat = 0
 
-# Send 'pico_ID' packet
-send_hello_packet(s)
+while True:
+    s = create_tcp_connection()
+    send_hello_packet(s)
+    last_heartbeat = time.time()
 
-try:
-    while True:
-        # Check for incoming UART data
-        if uart1.any():
-            rxed = uart1.read().decode('utf-8').rstrip()
-            s.send(rxed.encode()) # Send the uart received data to the TCP server
-            blink_led()
-            #print("Serial: ", rxed)
+    try:
+        while True:
+            now = time.time()
 
-        # Non-blocking mode to avoid halting the execution if no data is available.
-        s.setblocking(False)
-        try:
-            data = s.recv(64) # Data received from TCP Server
+            # Read from UART
+            if uart1.any():
+                try:
+                    rxed = uart1.read().decode('utf-8').rstrip()
+                    if rxed:
+                        print(f"[UART] Received: '{rxed}'")
+                        s.send(rxed.encode())
+                        print(f"[TCP] Sent to server: '{rxed}'")
+                        blink_led()
+                except Exception as e:
+                    print(f"[UART] Read error: {e}")
 
-            if data == b'':  # Empty byte string indicates that the other side of the TCP connection has closed
-                s.close()  # Closes the socket on Pico-W's side      
-                led.off()
-                print("TCP connection closed by server. Reconnecting...")
-                s = create_tcp_connection()
-                send_hello_packet(s)
-                print("Reconnected to server.")
-                continue
+            # Check for incoming TCP data
+            s.setblocking(False)
+            try:
+                data = s.recv(64)
+                if data == b'':
+                    print("[TCP] Server closed connection.")
+                    raise Exception("Server closed connection")
+                if data:
+                    cmd = data.decode()
+                    print(f"[TCP] Command received: '{cmd}'")
+                    uart1.write(cmd)
+                    print(f"[UART] Sent to UART: '{cmd}'")
+                    blink_led()
+            except OSError as e:
+                if getattr(e, 'errno', None) not in (11, 35):  # not EAGAIN/EWOULDBLOCK
+                    print(f"[TCP] Recv error: {e}")
+                    raise
+            except Exception as e:
+                print(f"[TCP] Recv exception: {e}")
+                raise
+            finally:
+                s.setblocking(True)
 
-            if data:	# Valid data received from TCP Server
-                cmd = data.decode()
-                uart1.write(cmd)
-                blink_led()
-                #print("TCP: ", cmd)
+            # Send heartbeat ping
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                try:
+                    s.send(b'PING')
+                    print("[TCP] Sent heartbeat: PING")
+                    s.settimeout(2)
+                    pong = s.recv(64)
+                    if pong:
+                        pong_msg = pong.decode().strip()
+                        print(f"[TCP] Heartbeat response: '{pong_msg}'")
+                        if pong_msg.upper() != "PONG":
+                            raise Exception("Unexpected heartbeat response")
+                    else:
+                        raise Exception("No heartbeat response")
+                except Exception as e:
+                    print(f"[TCP] Heartbeat failed: {e}")
+                    raise
+                finally:
+                    s.settimeout(None)
+                    last_heartbeat = now
 
-        except Exception as e:
-            pass  # No data received, normal for non-blocking call
+            time.sleep(0.05)
 
-        # Set blocking mode to block until all the data has been sent to the TCP server 
-        s.setblocking(True)
-        time.sleep(0.05)  # Short delay to prevent CPU overload
-
-except Exception as e:
-    print("An error occurred:", e)
-    
-finally:
-    s.close()
-    led.off()
-    print("TCP socket closed")
+    except Exception as e:
+        print(f"[MAIN] Lost connection: {e}")
+        print("[MAIN] Reconnecting...")
+    finally:
+        try: s.close()
+        except: pass
+        led.off()
+        print("[TCP] Socket closed.")
+        print("[MAIN] Restarting connection loop in 1 second...")
+        time.sleep(1)
