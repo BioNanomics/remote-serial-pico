@@ -27,6 +27,7 @@
   "author": "Rajkumar Gara",
   "license": "ISC",
   "dependencies": {
+    "js-yaml": "^4.1.0",
     "moment-timezone": "^0.5.45",
     "node-pty": "^1.0.0",
     "winston": "^3.12.0",
