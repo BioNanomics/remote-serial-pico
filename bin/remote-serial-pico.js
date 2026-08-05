@@ -22,7 +22,8 @@ fi &&
 cd /home/project/remote-serial-pico/src/pi && 
 sudo cp 99-pico.rules /etc/udev/rules.d/ && 
 sudo udevadm control --reload-rules && 
-sudo udevadm trigger
+sudo udevadm trigger &&
+sudo cp ptyserver.service /etc/systemd/system
 `;
 
 function runCommands(commands) {
@@ -36,4 +37,5 @@ runCommands(npmInstallCommand);
 console.log("Setting up remote-serial-pico project...");
 runCommands(setupProjectCommands);
 console.log("Starting the project...");
-execSync('node PtyServer.js', { stdio: 'inherit', cwd: '/home/project/remote-serial-pico/src/pi', shell: true });
+runCommands(`systemctl start ptyserver.service`);
+// execSync('node PtyServer.js', { stdio: 'inherit', cwd: '/home/project/remote-serial-pico/src/pi', shell: true });

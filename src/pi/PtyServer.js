@@ -137,18 +137,27 @@ function setupPicoPty(picoName) {
 function createSymlink(picoName, ptsName) {
     const symlinkPath = `${config.symlinkDir}/${picoName}`;
     try {
-        if (fs.existsSync(symlinkPath)) {
-            const currentTarget = fs.readlinkSync(symlinkPath);  // Check where the symlink points to
-            if (currentTarget !== ptsName) {
-                fs.unlinkSync(symlinkPath);  // Remove the old symlink if it's wrong
-                fs.symlinkSync(ptsName, symlinkPath);  // Create a new symlink
-                logger.info(`Updated symlink ${symlinkPath} -> ${ptsName}`);
-            } else {
-                logger.info(`Symlink ${symlinkPath} -> ${ptsName} already exists`);
+        // readlinkSync inspects the link itself. fs.existsSync() follows it and
+        // reports false for a dangling link (the pty it points at is gone after a
+        // reboot), which would send us down the "create" path and throw EEXIST.
+        let currentTarget = null;
+        try {
+            currentTarget = fs.readlinkSync(symlinkPath);
+        } catch (err) {
+            if (err.code !== 'ENOENT') {
+                throw err;
             }
-        } else {
-            fs.symlinkSync(ptsName, symlinkPath);  // Create the symlink if it doesn't exist
+        }
+
+        if (currentTarget === null) {
+            fs.symlinkSync(ptsName, symlinkPath);  // Nothing there, create the symlink
             logger.info(`Created symlink ${symlinkPath} -> ${ptsName}`);
+        } else if (currentTarget !== ptsName) {
+            fs.unlinkSync(symlinkPath);  // Stale or wrong target (incl. dangling links)
+            fs.symlinkSync(ptsName, symlinkPath);
+            logger.info(`Updated symlink ${symlinkPath} -> ${ptsName}`);
+        } else {
+            logger.info(`Symlink ${symlinkPath} -> ${ptsName} already exists`);
         }
     } catch (err) {
         logger.error(`Error creating symlink: ${err.message}`);
@@ -185,25 +194,43 @@ function writePicoRespToPty(picoName, response) {
     }
 }
 
+// The Pico sends 'pico_<serialId>' and 'PING' without any terminator, so TCP is
+// free to coalesce them with the device data that follows. Match the tokens
+// exactly instead of assuming a packet holds nothing else.
+const REGISTRATION_PATTERN = /^pico_([0-9a-fA-F]{16})/;
+const HEARTBEAT = 'PING';
+
 // TCP server to listen for connections from Pico devices
 const server = net.createServer((socket) => {
     let picoName = null;
 
     socket.on('data', (data) => {
-        const message = data.toString().trim();
+        let message = data.toString();
 
-        // 💓 Heartbeat: respond to PING with PONG
-        if (message === 'PING') {
-            socket.write('PONG\n');
-            logger.info(`Heartbeat received from ${picoName || 'unknown'} -> Responded with PONG`);
+        // Registration: consume only the 'pico_<serialId>' token. Anything after it
+        // is device data, not part of the serial id.
+        const registration = REGISTRATION_PATTERN.exec(message);
+        if (registration) {
+            picoName = handlePicoConnection(registration[1], socket);
+            message = message.slice(registration[0].length);
+        } else if (message.startsWith('pico_')) {
+            logger.warn(`Ignoring malformed registration packet: ${JSON.stringify(message)}`);
             return;
         }
 
-        if (message.startsWith('pico_')) {
-            const serialId = message.slice(5);
-            picoName = handlePicoConnection(serialId, socket);
-        } else if (picoName) {
-            writePicoRespToPty(picoName, message);
+        // 💓 Heartbeat: respond to PING with PONG, once per PING in the packet
+        const segments = message.split(HEARTBEAT);
+        if (segments.length > 1) {
+            for (let i = 1; i < segments.length; i++) {
+                socket.write('PONG\n');
+            }
+            logger.info(`Heartbeat received from ${picoName || 'unknown'} -> Responded with PONG`);
+            message = segments.join('');
+        }
+
+        const response = message.trim();
+        if (picoName && response) {
+            writePicoRespToPty(picoName, response);
         }
     });
 
