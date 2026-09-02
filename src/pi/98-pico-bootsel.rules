@@ -1,0 +1,39 @@
+# 98-pico-bootsel.rules -- issue #19 Phase A.
+# DRAFT: not installed by the installer, not yet tested against hardware.
+#
+# Companion to 99-pico.rules. That rule matches 2e8a:0005, the serial interface
+# a board presents once MicroPython is running. This one matches the step
+# before that: a Pico whose flash is blank (or held in BOOTSEL) enumerates as a
+# USB mass-storage device instead, and needs MicroPython copied onto it first.
+#
+#   blank board --(this rule + PicoFirmwareFlasher.py)--> MicroPython
+#               --(99-pico.rules + PicoScriptDeployer.py)--> main.py
+#
+# Why systemd-run rather than calling the script straight from RUN+=:
+#   udev kills RUN+= commands that outlive its event timeout and runs them in a
+#   stripped-down environment. A UF2 copy plus filesystem-readiness retries can
+#   take longer than that, and udisksctl wants a normal environment. Handing
+#   off to a transient unit sidesteps both, and the flash then shows up in
+#   `journalctl -u 'pico-flash-*'` as well as /tmp/deployer.log.
+#
+# Install (manual for now; the installer does not know about this yet):
+#   sudo mkdir -p /home/project/firmware
+#   sudo cp RPI_PICO_W-<ver>.uf2  /home/project/firmware/RPI_PICO_W.uf2
+#   sudo cp RPI_PICO2_W-<ver>.uf2 /home/project/firmware/RPI_PICO2_W.uf2
+#   sudo cp src/pi/98-pico-bootsel.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo touch /home/project/firmware/autoflash-enabled   # kill switch: absent = do nothing
+#
+# Watch it:
+#   tail -f /tmp/deployer.log
+#   journalctl -f -u 'pico-flash-*'
+#
+# Matches the partition node (/dev/sda1), which is where the RPI-RP2 / RP2350
+# filesystem lives and what udisksctl mounts. If `lsblk` on a real board shows
+# the filesystem directly on /dev/sda with no sda1, change DEVTYPE to "disk".
+# 0003 is the RP2040 bootloader, 000f the RP2350 bootloader; 2e8a is Raspberry
+# Pi. ID_MODEL_ID is passed as an argument because systemd-run does not forward
+# udev's environment into the unit. System python3 is enough: the script uses
+# only the standard library, so the rshell venv is not needed here.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0003|000f", RUN+="/usr/bin/systemd-run --no-block --collect --unit=pico-flash-%k /usr/bin/python3 /home/project/remote-serial-pico/src/pi/PicoFirmwareFlasher.py %E{DEVNAME} %E{ID_MODEL_ID}"
