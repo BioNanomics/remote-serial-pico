@@ -163,6 +163,7 @@ class TestGuards(FlasherTestCase):
         self.assertIn('2e8a:0003 in BOOTSEL', log)
         self.assertIn('2e8a:000f in BOOTSEL', log)
         self.assertIn('network.WLAN()', log)
+        self.assertNotIn('WARNING', log)   # fleet is all Pico W: a note, not a warning
 
     def test_rp2350_selects_pico2_image_and_label(self):
         self.enable()
