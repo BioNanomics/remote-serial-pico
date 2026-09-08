@@ -39,8 +39,9 @@ BOOTSEL_TARGETS = {
 
 # In BOOTSEL the ROM bootloader enumerates, not the board, so a plain Pico and
 # a Pico W present the same product id. This script cannot tell them apart and
-# always flashes the wireless image. A non-wireless board will boot MicroPython
-# fine and then die in main.py at network.WLAN(), so say so in the log.
+# always flashes the wireless image. Every board in this deployment is a Pico W,
+# so this is logged as a note rather than a warning; a non-wireless board would
+# boot MicroPython fine and then fail in main.py at network.WLAN().
 WIRELESS_AMBIGUITY = {
     '0003': 'Pico, Pico H and Pico W all report 2e8a:0003 in BOOTSEL',
     '000f': 'Pico 2 and Pico 2 W both report 2e8a:000f in BOOTSEL',
@@ -237,9 +238,9 @@ def flash(device, product_id):
     uf2_path = os.path.join(FIRMWARE_DIR, uf2_name)
 
     if product_id in WIRELESS_AMBIGUITY:
-        log_message(f'WARNING: {WIRELESS_AMBIGUITY[product_id]}; cannot confirm this '
-                    f'board has WiFi. Flashing {uf2_name} regardless - a non-wireless '
-                    f'board will boot but main.py will fail at network.WLAN()')
+        log_message(f'note: {WIRELESS_AMBIGUITY[product_id]}; assuming a wireless board '
+                    f'and flashing {uf2_name} (a non-wireless board would boot but fail '
+                    f'in main.py at network.WLAN())')
 
     if not os.path.isfile(uf2_path):
         log_message(f'Firmware image {uf2_path} not found - cache it first, '
