@@ -1,5 +1,7 @@
 # 98-pico-bootsel.rules -- issue #19 Phase A.
-# DRAFT: not installed by the installer, not yet tested against hardware.
+# Tested 2026-09-08 on a Pi 4 Model B Rev 1.1 running Raspberry Pi OS Lite 64-bit
+# (trixie): a Pico W in BOOTSEL was flashed with no manual intervention. Not yet
+# installed by the installer; see the install steps below.
 #
 # Companion to 99-pico.rules. That rule matches 2e8a:0005, the serial interface
 # a board presents once MicroPython is running. This one matches the step
@@ -29,8 +31,8 @@
 #   journalctl -f -u 'pico-flash-*'
 #
 # Matches the partition node (/dev/sda1), which is where the RPI-RP2 / RP2350
-# filesystem lives and what udisksctl mounts. If `lsblk` on a real board shows
-# the filesystem directly on /dev/sda with no sda1, change DEVTYPE to "disk".
+# filesystem lives and what udisksctl mounts. Confirmed on hardware: the
+# bootloader volume is a partition (DEVTYPE=partition), not the whole disk.
 # 0003 is the RP2040 bootloader, 000f the RP2350 bootloader; 2e8a is Raspberry
 # Pi. ID_MODEL_ID is passed as an argument because systemd-run does not forward
 # udev's environment into the unit. System python3 is enough: the script uses
