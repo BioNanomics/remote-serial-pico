@@ -17,6 +17,10 @@ logs/
 src/pi/config.yaml
 src/pi/ptyserver.service
 
+# Python bytecode (a stale .pyc will happily hide a source change)
+__pycache__/
+*.py[cod]
+
 # Compiled output
 *.o
 *.out
