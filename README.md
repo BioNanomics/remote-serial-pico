@@ -175,6 +175,35 @@ rule watches for.
 > work. Headers are only pre-soldered on the "H" variants; this project needs GP4,
 > GP5 and GND, so a plain board means soldering.
 
+#### Or let the Pi do step 1 for you (auto-flash)
+
+`src/pi/PicoFirmwareFlasher.py` does the copy above by itself when a board in
+BOOTSEL mode is plugged in. It is opt-in and off by default. To enable it on a Pi:
+
+```bash
+# 1. cache the firmware, named exactly like this (the script never downloads)
+sudo mkdir -p /home/project/firmware
+sudo cp RPI_PICO_W-<version>.uf2  /home/project/firmware/RPI_PICO_W.uf2
+sudo cp RPI_PICO2_W-<version>.uf2 /home/project/firmware/RPI_PICO2_W.uf2   # if you have Pico 2 W boards
+
+# 2. install the udev rule that starts the script
+sudo cp src/pi/98-pico-bootsel.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+
+# 3. the kill switch: nothing is ever flashed while this file is absent
+sudo touch /home/project/firmware/autoflash-enabled
+```
+
+Then plug in a board in BOOTSEL mode (a fresh one is already in it; otherwise hold
+**BOOTSEL** while plugging in, and let go once it is in). Within about fifteen
+seconds it reboots as MicroPython and the existing `99-pico.rules` takes over.
+Watch it with `tail -f /tmp/deployer.log` or `journalctl -f -u 'pico-flash-*'`.
+Remove `autoflash-enabled` to switch it off again.
+
+The script only touches a volume labelled `RPI-RP2` or `RP2350`, and it treats
+the board vanishing mid-copy as success, because that is the board rebooting. To
+run it by hand for a specific device: `sudo python3 src/pi/PicoFirmwareFlasher.py /dev/sda1`.
+
 ### Step 2: Plug it into the Pi
 
 With MicroPython on board, just plug the Pico into the Pi's USB port. The udev
