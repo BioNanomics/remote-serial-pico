@@ -2,7 +2,8 @@ import network
 import socket
 import time
 import json
-from machine import UART, Pin
+from machine import UART, Pin, WDT
+from net_util import safe_decode, Backoff
 
 # Load network configuration
 def read_config():
@@ -21,29 +22,45 @@ uart1 = UART(1, 19200)
 uart1.init(19200, bits=8, parity=None, stop=1, tx=4, rx=5)
 led = Pin("LED", Pin.OUT)
 
+# Hardware watchdog: if the main loop ever stops calling wdt.feed() -- a true
+# hang that no try/except can catch, e.g. blocked forever inside a driver call
+# -- the RP2040 resets itself instead of staying dark until someone notices.
+# 8388 ms is the RP2040 watchdog's own maximum; there is no larger timeout to
+# ask for. wdt.feed() is called once per iteration of the inner loop below,
+# which sleeps at most 0.05s per pass, so a live board feeds it constantly.
+WATCHDOG_TIMEOUT_MS = 8388
+wdt = WDT(timeout=WATCHDOG_TIMEOUT_MS)
+
 def blink_led():
     led.off()
     time.sleep(0.1)
     led.on()
     time.sleep(0.1)
 
-# Connect to Wi-Fi
+# Connect to Wi-Fi. wdt.feed() here too: on a very slow join, the loop below
+# would otherwise not run for long enough to feed the watchdog in time.
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
 print(f"[WiFi] Connecting to SSID: {WIFI_SSID}")
 wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 wifi_attempts = 0
 while not wlan.isconnected():
+    wdt.feed()
     blink_led()
     wifi_attempts += 1
     print(f"[WiFi] Waiting for connection... attempt {wifi_attempts}")
 print(f"[WiFi] Connected! IP: {wlan.ifconfig()[0]}")
 led.off()
 
-# Establish TCP connection to server
+# Establish TCP connection to server. Backoff (1s, 2s, 4s ... capped at 30s)
+# instead of a fixed 5s retry, so a Pi that is down for a while does not get
+# hammered by every Pico in the building at once.
+tcp_backoff = Backoff(base=1, cap=30)
+
 def create_tcp_connection():
     attempt = 1
     while True:
+        wdt.feed()
         try:
             print(f"[TCP] Connecting to {IP_ADDRESS}:{TCP_PORT} (attempt {attempt})")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -52,13 +69,15 @@ def create_tcp_connection():
             sock.settimeout(None)
             led.on()
             print("[TCP] Connected successfully")
+            tcp_backoff.reset()
             return sock
         except Exception as e:
             print(f"[TCP] Connection failed: {e}")
             try: sock.close()
             except: pass
-            print("[TCP] Retrying in 5 seconds...")
-            time.sleep(5)
+            delay = tcp_backoff.next()
+            print(f"[TCP] Retrying in {delay} second(s)...")
+            time.sleep(delay)
             attempt += 1
 
 # Send hello identification message
@@ -79,10 +98,15 @@ while True:
         while True:
             now = time.time()
 
-            # Read from UART
+            wdt.feed()
+
+            # Read from UART. safe_decode never raises on a malformed byte --
+            # it swaps it for U+FFFD and keeps the rest of the line -- so one
+            # noisy byte from the serial device can no longer end the loop
+            # (issue #19: "invalid UTF-8 doesn't disconnect").
             if uart1.any():
                 try:
-                    rxed = uart1.read().decode('utf-8').rstrip()
+                    rxed = safe_decode(uart1.read()).rstrip()
                     if rxed:
                         print(f"[UART] Received: '{rxed}'")
                         s.send(rxed.encode())
@@ -99,7 +123,7 @@ while True:
                     print("[TCP] Server closed connection.")
                     raise Exception("Server closed connection")
                 if data:
-                    cmd = data.decode()
+                    cmd = safe_decode(data)
                     print(f"[TCP] Command received: '{cmd}'")
                     uart1.write(cmd)
                     print(f"[UART] Sent to UART: '{cmd}'")
@@ -122,7 +146,7 @@ while True:
                     s.settimeout(2)
                     pong = s.recv(64)
                     if pong:
-                        pong_msg = pong.decode().strip()
+                        pong_msg = safe_decode(pong).strip()
                         print(f"[TCP] Heartbeat response: '{pong_msg}'")
                         if pong_msg.upper() != "PONG":
                             raise Exception("Unexpected heartbeat response")
