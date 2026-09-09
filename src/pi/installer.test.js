@@ -157,6 +157,14 @@ test('stepClone clones from the BioNanomics repo and never pulls an existing che
     assert.strictEqual(ctx.run.calls.length, before, 'no git command on a re-run');
 });
 
+test('REMOTE_SERIAL_PICO_REPO/BRANCH select what gets cloned, for testing unmerged work', () => {
+    assert.deepStrictEqual(I.cfgFromEnv({}), {});
+    assert.deepStrictEqual(I.cfgFromEnv({ REMOTE_SERIAL_PICO_BRANCH: 'test/x' }), { branch: 'test/x' });
+    const d = tmp(); const ctx = ctxIn(d, { cfg: { branch: 'test/x' } });
+    I.stepClone(ctx);
+    assert.ok(ctx.run.calls.some(c => c.includes("git clone -q -b 'test/x' 'https://github.com/BioNanomics/remote-serial-pico'")));
+});
+
 // --- doctor ------------------------------------------------------------------
 
 test('doctor fails loudly with hints on an empty machine', () => {
