@@ -8,6 +8,7 @@ import json
 
 PICO_MAIN_PATH = '/home/project/remote-serial-pico/src/pico/main.py'
 PICO_CONFIG_PATH = '/home/project/remote-serial-pico/src/pico/config.json'
+PICO_NET_UTIL_PATH = '/home/project/remote-serial-pico/src/pico/net_util.py'
 
 TCP_PORT = 50000
 
@@ -99,9 +100,12 @@ def update_config_json(pico_serial_id):
 
 # Transfer the prepared script to the connected Pico.
 def transfer_script_to_pico(port):
-    # Transfer main.py, config.json to the pico using rshell
+    # Transfer main.py, net_util.py and config.json to the pico using rshell.
+    # main.py imports net_util, so leaving it out is not a partial deploy --
+    # it is a Pico that fails to boot at all.
     try:
-        subprocess.check_call(['/home/project/myenv/bin/rshell', '-p', port, 'cp', PICO_MAIN_PATH, PICO_CONFIG_PATH, '/pyboard/'])
+        subprocess.check_call(['/home/project/myenv/bin/rshell', '-p', port, 'cp',
+                               PICO_MAIN_PATH, PICO_NET_UTIL_PATH, PICO_CONFIG_PATH, '/pyboard/'])
     except subprocess.CalledProcessError as e:
         log_message(f'Error during transfer: {str(e)}')
     finally:
