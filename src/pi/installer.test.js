@@ -165,6 +165,25 @@ test('REMOTE_SERIAL_PICO_REPO/BRANCH select what gets cloned, for testing unmerg
     assert.ok(ctx.run.calls.some(c => c.includes("git clone -q -b 'test/x' 'https://github.com/BioNanomics/remote-serial-pico'")));
 });
 
+test('a removed-but-not-purged package counts as missing and gets reinstalled', () => {
+    const d = tmp();
+    const run = fakeRun({ 'dpkg-query': { stdout: 'deinstall ok config-files' } });
+    const ctx = ctxIn(d, { run });
+    const res = I.stepAptPackages(ctx);
+    assert.strictEqual(res.result, 'changed');
+    assert.ok(run.calls.some(c => c.startsWith('DEBIAN_FRONTEND=noninteractive apt-get install -y') && c.includes('udisks2')));
+    assert.strictEqual(I.packageInstalled(ctxIn(d, { run: fakeRun({ 'dpkg-query': { stdout: 'install ok installed' } }) }), 'udisks2'), true);
+});
+
+test('doctor checks the commands themselves, not just dpkg', () => {
+    const d = tmp();
+    const run = fakeRun({ 'command -v udisksctl': { status: 1 } });
+    const ch = I.doctorChecks(ctxIn(d, { run })).find(c => c.name === 'required commands');
+    assert.strictEqual(ch.ok, false);
+    assert.match(ch.detail, /udisksctl/);
+    assert.match(ch.hint, /apt-get install -y udisks2/);
+});
+
 // --- doctor ------------------------------------------------------------------
 
 test('doctor fails loudly with hints on an empty machine', () => {
