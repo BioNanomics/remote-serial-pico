@@ -15,6 +15,7 @@ const { spawnSync } = require('child_process');
 const DEFAULTS = Object.freeze({
     projectDir: '/home/project',
     repoUrl: 'https://github.com/BioNanomics/remote-serial-pico',
+    branch: null,          // null = the repo's default branch
     cloneDir: '/home/project/remote-serial-pico',
     venvDir: '/home/project/myenv',
     firmwareDir: '/home/project/firmware',
@@ -122,8 +123,18 @@ function resolveUser(env = process.env) {
     return me === 'root' ? null : me;
 }
 
+// REMOTE_SERIAL_PICO_REPO / REMOTE_SERIAL_PICO_BRANCH let you install from a
+// fork or an unmerged branch, e.g. to test a change on a spare Pi before it is
+// merged:  sudo REMOTE_SERIAL_PICO_BRANCH=my-branch remote-serial-pico install
+function cfgFromEnv(env = process.env) {
+    const out = {};
+    if (env.REMOTE_SERIAL_PICO_REPO) out.repoUrl = env.REMOTE_SERIAL_PICO_REPO;
+    if (env.REMOTE_SERIAL_PICO_BRANCH) out.branch = env.REMOTE_SERIAL_PICO_BRANCH;
+    return out;
+}
+
 function makeContext(overrides = {}) {
-    const cfg = { ...DEFAULTS, ...(overrides.cfg || {}) };
+    const cfg = { ...DEFAULTS, ...cfgFromEnv(overrides.env), ...(overrides.cfg || {}) };
     return {
         cfg,
         run: overrides.run || sh,
@@ -170,9 +181,10 @@ function stepClone(ctx) {
         // box executes. `doctor` reports if the checkout is behind.
         return { result: 'ok', detail: 'checkout present (not pulled)' };
     }
-    const r = ctx.run(`sudo -u ${ctx.user} git clone -q '${ctx.cfg.repoUrl}' '${ctx.cfg.cloneDir}'`);
+    const branchArg = ctx.cfg.branch ? `-b '${ctx.cfg.branch}' ` : '';
+    const r = ctx.run(`sudo -u ${ctx.user} git clone -q ${branchArg}'${ctx.cfg.repoUrl}' '${ctx.cfg.cloneDir}'`);
     if (r.status !== 0) return { result: 'failed', detail: r.stderr.split('\n').pop() };
-    return { result: 'changed', detail: `cloned ${ctx.cfg.repoUrl}` };
+    return { result: 'changed', detail: `cloned ${ctx.cfg.repoUrl}${ctx.cfg.branch ? ' (' + ctx.cfg.branch + ')' : ''}` };
 }
 
 function stepNpmInstall(ctx) {
@@ -289,7 +301,7 @@ function doctorChecks(ctx) {
     const git = ctx.fsx.existsSync(path.join(c.cloneDir, '.git'));
     let gitDetail = 'missing';
     if (git) {
-        const head = ctx.run(`git -C '${c.cloneDir}' log --oneline -1`).stdout;
+        const head = ctx.run(`git -C '${c.cloneDir}' log --oneline -1`).stdout + ' on ' + (ctx.run(`git -C '${c.cloneDir}' branch --show-current`).stdout || '?');
         const behind = ctx.run(`git -C '${c.cloneDir}' fetch -q 2>/dev/null; git -C '${c.cloneDir}' rev-list --count HEAD..@{u} 2>/dev/null`).stdout;
         gitDetail = head + (behind && behind !== '0' ? `  (${behind} commit(s) behind origin)` : '');
     }
@@ -401,7 +413,7 @@ function usage() {
 
 module.exports = {
     DEFAULTS, sh, renderConfig, renderUnit, parseFlatYaml, writeIfChanged, ensureDir, isWorldWritable,
-    resolveUser, makeContext,
+    resolveUser, cfgFromEnv, makeContext,
     stepAptPackages, stepProjectDir, stepVenv, stepClone, stepNpmInstall, stepConfig, stepFirmwareDir, stepUdevRules, stepService,
     INSTALL_STEPS, install, doctorChecks, doctor, status, usage
 };
