@@ -150,8 +150,15 @@ function makeContext(overrides = {}) {
 // install: one step per README "manual way" item, each idempotent
 // ---------------------------------------------------------------------------
 
+// `dpkg -s` exits 0 for a package that was removed but not purged ("config
+// files" state), so it is not a presence test. Ask for the status text.
+function packageInstalled(ctx, pkg) {
+    const r = ctx.run(`dpkg-query -W -f='\${Status}' ${pkg} 2>/dev/null`);
+    return r.status === 0 && /install ok installed/.test(r.stdout);
+}
+
 function stepAptPackages(ctx) {
-    const missing = ctx.cfg.aptPackages.filter(p => ctx.run(`dpkg -s ${p} >/dev/null 2>&1`).status !== 0);
+    const missing = ctx.cfg.aptPackages.filter(p => !packageInstalled(ctx, p));
     if (missing.length === 0) return { result: 'ok', detail: 'all present' };
     const r = ctx.run(`DEBIAN_FRONTEND=noninteractive apt-get install -y ${missing.join(' ')}`);
     if (r.status !== 0) return { result: 'failed', detail: `apt-get failed: ${r.stderr.split('\n').pop()}` };
@@ -292,6 +299,14 @@ function doctorChecks(ctx) {
 
     add('node', true, process.version, '');
 
+    // Commands the scripts call at runtime. A package can be half-removed and
+    // still satisfy dpkg, so check the commands themselves.
+    const needCmd = { git: 'git', python3: 'python3', udisksctl: 'udisks2' };
+    const missingCmd = Object.keys(needCmd).filter(cmd => ctx.run(`command -v ${cmd} >/dev/null 2>&1`).status !== 0);
+    add('required commands', missingCmd.length === 0,
+        missingCmd.length ? `missing: ${missingCmd.join(', ')}` : Object.keys(needCmd).join(', '),
+        `sudo apt-get install -y ${missingCmd.map(cmd => needCmd[cmd]).join(' ')}`);
+
     add('project directory', ctx.fsx.existsSync(c.projectDir) && !isWorldWritable(ctx.fsx, c.projectDir),
         ctx.fsx.existsSync(c.projectDir) ? (isWorldWritable(ctx.fsx, c.projectDir) ? 'world-writable (777)' : 'present, not world-writable') : 'missing',
         `sudo chmod 755 ${c.projectDir}`);
@@ -414,6 +429,6 @@ function usage() {
 module.exports = {
     DEFAULTS, sh, renderConfig, renderUnit, parseFlatYaml, writeIfChanged, ensureDir, isWorldWritable,
     resolveUser, cfgFromEnv, makeContext,
-    stepAptPackages, stepProjectDir, stepVenv, stepClone, stepNpmInstall, stepConfig, stepFirmwareDir, stepUdevRules, stepService,
+    packageInstalled, stepAptPackages, stepProjectDir, stepVenv, stepClone, stepNpmInstall, stepConfig, stepFirmwareDir, stepUdevRules, stepService,
     INSTALL_STEPS, install, doctorChecks, doctor, status, usage
 };
