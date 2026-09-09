@@ -2,17 +2,17 @@
   "name": "remote-serial-pico",
   "version": "1.0.1",
   "description": "Access remote serial devices connected to Pico with Pi",
-  "main": "remote-serial-pico.js",
+  "main": "src/pi/installer.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node remote-serial-pico.js"
+    "test": "node --test src/pi/*.test.js",
+    "start": "node src/pi/PtyServer.js"
   },
   "bin": {
     "remote-serial-pico": "./bin/remote-serial-pico.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RajkumarGara/remote-serial-pico.git"
+    "url": "git+https://github.com/BioNanomics/remote-serial-pico.git"
   },
   "keywords": [
     "raspberry-pi",
@@ -34,7 +34,7 @@
     "winston-syslog": "^2.7.0"
   },
   "bugs": {
-    "url": "https://github.com/RajkumarGara/remote-serial-pico/issues"
+    "url": "https://github.com/BioNanomics/remote-serial-pico/issues"
   },
-  "homepage": "https://github.com/RajkumarGara/remote-serial-pico#readme"
+  "homepage": "https://github.com/BioNanomics/remote-serial-pico#readme"
 }
