@@ -49,24 +49,37 @@ sudo npm i -g remote-serial-pico
 remote-serial-pico i
 ```
 
-`remote-serial-pico i` runs [bin/remote-serial-pico.js](./bin/remote-serial-pico.js),
-which creates `/home/project`, builds a Python venv there with `rshell` in it,
-clones this repo into `/home/project/remote-serial-pico`, installs the udev rule,
-copies the systemd unit, and starts the service.
+`remote-serial-pico i` (or `install`) does every step of "the manual way" below,
+in order, and skips anything already done, so running it again is safe:
 
-> **It does not finish the job.** `src/pi/config.yaml` and `src/pi/ptyserver.service`
-> are host-specific and are not in the repo, so a fresh clone has neither — the
-> unit copy fails and the service will not start. Create both by hand as shown
-> below, then start the service. Do this once and the installer's other steps are
-> already done.
+| Step | What it does |
+| --- | --- |
+| apt packages | git, python3, venv, pip, build-essential, udisks2 |
+| `/home/project` | created `755`, owned by you (not world-writable) |
+| rshell venv | `/home/project/myenv` with `rshell` |
+| checkout | clones this repo into `/home/project/remote-serial-pico`; never pulls on re-run |
+| `npm install` | inside the checkout, as you |
+| `config.yaml` | written with the defaults below if missing; never overwritten |
+| firmware cache | `/home/project/firmware/` for auto-flash (off until you enable it) |
+| udev rules | every `src/pi/*.rules`, reloaded only when one changed |
+| service | unit written with your user and your `node`, `enable`d so it survives reboots, started |
 
-### The manual way (and what the installer leaves out)
+Then check it:
+
+```bash
+remote-serial-pico doctor    # every component, with a fix hint for anything wrong
+remote-serial-pico status    # is it up, which Picos are connected, is auto-flash on
+```
+
+`doctor` exits non-zero if anything is wrong, so it can gate a script.
+
+### The manual way (what the installer does for you)
 
 **1. Create the working directory and the rshell venv.** `/home/project` is
 hard-coded throughout this project; it is not currently configurable.
 
 ```bash
-sudo mkdir -m 777 /home/project
+sudo mkdir -m 755 /home/project && sudo chown $USER:$USER /home/project
 cd /home/project
 sudo apt install -y python3-venv python3-pip build-essential
 python3 -m venv myenv
@@ -77,7 +90,7 @@ python3 -m venv myenv
 
 ```bash
 cd /home/project
-git clone https://github.com/RajkumarGara/remote-serial-pico
+git clone https://github.com/BioNanomics/remote-serial-pico
 cd remote-serial-pico
 npm install
 ```
@@ -140,8 +153,7 @@ sudo systemctl enable --now ptyserver.service
 sudo systemctl status ptyserver.service
 ```
 
-`enable` is what makes it survive a reboot — the installer script only does
-`start`, so remember this step.
+`enable` is what makes it survive a reboot. The installer does this for you.
 
 **6. Confirm it is listening.**
 
