@@ -49,24 +49,37 @@ sudo npm i -g remote-serial-pico
 remote-serial-pico i
 ```
 
-`remote-serial-pico i` runs [bin/remote-serial-pico.js](./bin/remote-serial-pico.js),
-which creates `/home/project`, builds a Python venv there with `rshell` in it,
-clones this repo into `/home/project/remote-serial-pico`, installs the udev rule,
-copies the systemd unit, and starts the service.
+`remote-serial-pico i` (or `install`) does every step of "the manual way" below,
+in order, and skips anything already done, so running it again is safe:
 
-> **It does not finish the job.** `src/pi/config.yaml` and `src/pi/ptyserver.service`
-> are host-specific and are not in the repo, so a fresh clone has neither — the
-> unit copy fails and the service will not start. Create both by hand as shown
-> below, then start the service. Do this once and the installer's other steps are
-> already done.
+| Step | What it does |
+| --- | --- |
+| apt packages | git, python3, venv, pip, build-essential, udisks2 |
+| `/home/project` | created `755`, owned by you (not world-writable) |
+| rshell venv | `/home/project/myenv` with `rshell` |
+| checkout | clones this repo into `/home/project/remote-serial-pico`; never pulls on re-run |
+| `npm install` | inside the checkout, as you |
+| `config.yaml` | written with the defaults below if missing; never overwritten |
+| firmware cache | `/home/project/firmware/` for auto-flash (off until you enable it) |
+| udev rules | every `src/pi/*.rules`, reloaded only when one changed |
+| service | unit written with your user and your `node`, `enable`d so it survives reboots, started |
 
-### The manual way (and what the installer leaves out)
+Then check it:
+
+```bash
+remote-serial-pico doctor    # every component, with a fix hint for anything wrong
+remote-serial-pico status    # is it up, which Picos are connected, is auto-flash on
+```
+
+`doctor` exits non-zero if anything is wrong, so it can gate a script.
+
+### The manual way (what the installer does for you)
 
 **1. Create the working directory and the rshell venv.** `/home/project` is
 hard-coded throughout this project; it is not currently configurable.
 
 ```bash
-sudo mkdir -m 777 /home/project
+sudo mkdir -m 755 /home/project && sudo chown $USER:$USER /home/project
 cd /home/project
 sudo apt install -y python3-venv python3-pip build-essential
 python3 -m venv myenv
@@ -77,7 +90,7 @@ python3 -m venv myenv
 
 ```bash
 cd /home/project
-git clone https://github.com/RajkumarGara/remote-serial-pico
+git clone https://github.com/BioNanomics/remote-serial-pico
 cd remote-serial-pico
 npm install
 ```
@@ -140,8 +153,7 @@ sudo systemctl enable --now ptyserver.service
 sudo systemctl status ptyserver.service
 ```
 
-`enable` is what makes it survive a reboot — the installer script only does
-`start`, so remember this step.
+`enable` is what makes it survive a reboot. The installer does this for you.
 
 **6. Confirm it is listening.**
 
@@ -174,6 +186,35 @@ rule watches for.
 > Buy the **Pico W** or **Pico 2 W** — a non-wireless Pico has no WiFi and cannot
 > work. Headers are only pre-soldered on the "H" variants; this project needs GP4,
 > GP5 and GND, so a plain board means soldering.
+
+#### Or let the Pi do step 1 for you (auto-flash)
+
+`src/pi/PicoFirmwareFlasher.py` does the copy above by itself when a board in
+BOOTSEL mode is plugged in. It is opt-in and off by default. To enable it on a Pi:
+
+```bash
+# 1. cache the firmware, named exactly like this (the script never downloads)
+sudo mkdir -p /home/project/firmware
+sudo cp RPI_PICO_W-<version>.uf2  /home/project/firmware/RPI_PICO_W.uf2
+sudo cp RPI_PICO2_W-<version>.uf2 /home/project/firmware/RPI_PICO2_W.uf2   # if you have Pico 2 W boards
+
+# 2. install the udev rule that starts the script
+sudo cp src/pi/98-pico-bootsel.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+
+# 3. the kill switch: nothing is ever flashed while this file is absent
+sudo touch /home/project/firmware/autoflash-enabled
+```
+
+Then plug in a board in BOOTSEL mode (a fresh one is already in it; otherwise hold
+**BOOTSEL** while plugging in, and let go once it is in). Within about fifteen
+seconds it reboots as MicroPython and the existing `99-pico.rules` takes over.
+Watch it with `tail -f /tmp/deployer.log` or `journalctl -f -u 'pico-flash-*'`.
+Remove `autoflash-enabled` to switch it off again.
+
+The script only touches a volume labelled `RPI-RP2` or `RP2350`, and it treats
+the board vanishing mid-copy as success, because that is the board rebooting. To
+run it by hand for a specific device: `sudo python3 src/pi/PicoFirmwareFlasher.py /dev/sda1`.
 
 ### Step 2: Plug it into the Pi
 
