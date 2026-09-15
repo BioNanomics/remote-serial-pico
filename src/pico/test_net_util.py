@@ -68,5 +68,44 @@ class TestBackoff(unittest.TestCase):
             N.Backoff(base=1, factor=1)
 
 
+class TestIsHeartbeatReply(unittest.TestCase):
+
+    def test_recognises_pong_however_it_arrives(self):
+        for text in ('PONG', 'pong', ' PONG ', 'PONG\n', '\r\nPoNg\r\n'):
+            self.assertTrue(N.is_heartbeat_reply(text), text)
+
+    def test_device_data_is_not_a_pong(self):
+        for text in ('MECHO_50', '255.19.255.QY=FE', '', 'PONGED', 'A PONG'):
+            self.assertFalse(N.is_heartbeat_reply(text), text)
+
+
+class TestHeartbeatMonitor(unittest.TestCase):
+
+    def test_one_missed_pong_does_not_drop_the_connection(self):
+        # the whole point: a single lost packet used to cause a reconnect
+        h = N.HeartbeatMonitor(max_misses=3)
+        self.assertFalse(h.missed())
+        self.assertEqual(h.misses, 1)
+
+    def test_drops_only_after_max_consecutive_misses(self):
+        h = N.HeartbeatMonitor(max_misses=3)
+        self.assertEqual([h.missed() for _ in range(3)], [False, False, True])
+
+    def test_a_good_pong_forgets_earlier_misses(self):
+        h = N.HeartbeatMonitor(max_misses=3)
+        h.missed(); h.missed()
+        h.pong()
+        self.assertEqual(h.misses, 0)
+        # back to a full budget, so an isolated miss later is still tolerated
+        self.assertFalse(h.missed())
+
+    def test_max_misses_of_one_drops_immediately(self):
+        self.assertTrue(N.HeartbeatMonitor(max_misses=1).missed())
+
+    def test_rejects_nonsense_config(self):
+        with self.assertRaises(ValueError):
+            N.HeartbeatMonitor(max_misses=0)
+
+
 if __name__ == '__main__':
     unittest.main()

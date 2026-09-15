@@ -43,3 +43,36 @@ class Backoff:
         delay = self._delay
         self._delay = min(self._delay * self.factor, self.cap)
         return delay
+
+def is_heartbeat_reply(text):
+    """True if this text is the server's PONG and not device data.
+
+    A PONG that arrived too late to be matched to its PING must not be
+    written to the UART as if the serial device had sent it.
+    """
+    return text.strip().upper() == 'PONG'
+
+
+class HeartbeatMonitor:
+    """Counts consecutive missed PONGs.
+
+    The office WiFi drops packets (there is a ticket for it), and the original
+    firmware tore down a perfectly good TCP connection the first time a single
+    PONG went missing, then reconnected -- over and over. Tolerate a few in a
+    row and only give up when the connection really is gone.
+    """
+
+    def __init__(self, max_misses=3):
+        if max_misses < 1:
+            raise ValueError('max_misses must be at least 1')
+        self.max_misses = max_misses
+        self.misses = 0
+
+    def pong(self):
+        """A good PONG arrived: forget any earlier misses."""
+        self.misses = 0
+
+    def missed(self):
+        """No usable PONG. True if the connection should now be dropped."""
+        self.misses += 1
+        return self.misses >= self.max_misses
