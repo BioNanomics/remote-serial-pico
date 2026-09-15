@@ -1,64 +1,129 @@
 #!/usr/bin/python3
+"""Deploy main.py and config.json to a Pico that has just appeared as a serial
+device. Run by 99-pico.rules with: DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT.
+
+Before writing config.json it fills in the Pi's own WiFi name and password and
+its IP address, so the Pico can reach PtyServer without anyone editing a file.
+"""
 import datetime
+import json
 import os
+import socket
 import subprocess
 import sys
-import socket
-import json
+import termios
+import time
+import tty
 
 PICO_MAIN_PATH = '/home/project/remote-serial-pico/src/pico/main.py'
 PICO_CONFIG_PATH = '/home/project/remote-serial-pico/src/pico/config.json'
+RSHELL = '/home/project/myenv/bin/rshell'
+NM_KEYFILE_DIR = '/etc/NetworkManager/system-connections'
+LOG_PATH = '/tmp/deployer.log'
 
 TCP_PORT = 50000
 
+
 def log_message(message):
-    with open('/tmp/deployer.log', 'a') as log_file:
-        log_file.write(f'{message}\n')
+    with open(LOG_PATH, 'a') as log_file:
+        log_file.write(f'{datetime.datetime.now()} {message}\n')
 
-# Fetch the SSID of the currently active WiFi connection using nmcli command.
-def get_wifi_ssid():
+
+def run(cmd):
+    """Run a command; return its stdout stripped, or None if it is missing or fails."""
     try:
-        # Execute to get the active SSID
-        ssid = subprocess.check_output("iwgetid -r", shell=True).decode().strip()
-    except subprocess.CalledProcessError:
-        ssid = None  # None signifies an error or no active connection.
-    return ssid
-
-# Retrieve WiFi credentials for a given SSID from the system's network manager.
-def get_wifi_ssid_pswd(ssid):
-    cred_path1 = f'/etc/NetworkManager/system-connections/{ssid}.nmconnection' if ssid else None
-    cred_path2 = '/etc/NetworkManager/system-connections/preconfigured.nmconnection'
-    
-    # Function to extract psk from a given credential path
-    def extract_psk(cred_path):
-        if cred_path and os.path.exists(cred_path):
-            with open(cred_path, 'r') as file:
-                for line in file:
-                    if 'psk=' in line:
-                        return line.split('=')[1].strip()
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+    except (OSError, subprocess.CalledProcessError):
         return None
-    
-    psk = extract_psk(cred_path1)
-    # If PSK not found in the first path, try the second
-    if psk is None:
-        psk = extract_psk(cred_path2)
-    return ssid, psk
 
-# Determine the external IP address of the Raspberry Pi.
-def get_ip_address():
+
+# --- WiFi credentials --------------------------------------------------------
+#
+# Two ways, tried in order:
+#   1. nmcli, which NetworkManager ships on every Pi OS since Bookworm. It works
+#      whatever the connection file is called, which matters on images made by
+#      Raspberry Pi Imager or cloud-init, where the file is not named after the
+#      SSID and `iwgetid` is not installed.
+#   2. The old way: `iwgetid -r` for the SSID, then a keyfile that either is
+#      named after the SSID or contains a matching `ssid=` line.
+
+def _nm_unescape(value):
+    return value.replace('\\:', ':').replace('\\\\', '\\')
+
+
+def wifi_credentials_from_nmcli(run=run):
+    active = run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'])
+    if active is None:
+        return None, None
+    name = None
+    for line in active.splitlines():
+        parts = line.rsplit(':', 1)
+        if len(parts) == 2 and parts[1] == '802-11-wireless':
+            name = _nm_unescape(parts[0])
+            break
+    if not name:
+        return None, None
+    ssid = run(['nmcli', '-g', '802-11-wireless.ssid', 'connection', 'show', name])
+    psk = run(['nmcli', '-s', '-g', '802-11-wireless-security.psk', 'connection', 'show', name])
+    return (_nm_unescape(ssid) if ssid else None), (psk or None)
+
+
+def _psk_from_keyfile(path, want_ssid=None):
+    ssid_ok = want_ssid is None
+    psk = None
     try:
-        # Use a socket connection to a public DNS to fetch the external IP address.
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith('ssid=') and want_ssid is not None:
+                    ssid_ok = line[5:] == want_ssid
+                elif line.startswith('psk='):
+                    psk = line[4:]
+    except OSError:
+        return None
+    return psk if ssid_ok else None
+
+
+def wifi_credentials_from_files(run=run, keyfile_dir=NM_KEYFILE_DIR):
+    ssid = run(['iwgetid', '-r']) or None
+    candidates = []
+    if ssid:
+        candidates.append(os.path.join(keyfile_dir, f'{ssid}.nmconnection'))
+    candidates.append(os.path.join(keyfile_dir, 'preconfigured.nmconnection'))
+    try:
+        candidates += [os.path.join(keyfile_dir, n) for n in sorted(os.listdir(keyfile_dir)) if n.endswith('.nmconnection')]
+    except OSError:
+        pass
+    for path in candidates:
+        psk = _psk_from_keyfile(path, want_ssid=ssid)
+        if psk:
+            return ssid, psk
+    return ssid, None
+
+
+def get_wifi_credentials(run=run):
+    ssid, psk = wifi_credentials_from_nmcli(run)
+    if ssid and psk:
+        return ssid, psk, 'nmcli'
+    f_ssid, f_psk = wifi_credentials_from_files(run)
+    return (ssid or f_ssid), (psk or f_psk), 'keyfile'
+
+
+# --- the rest ----------------------------------------------------------------
+
+def get_ip_address():
+    """The address the Pico should connect to: whichever interface routes out."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
         s.connect(('8.8.8.8', 80))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = None  # None signifies an error or inability to determine the IP.
+        return s.getsockname()[0]
+    except OSError:
+        return None
     finally:
         s.close()
-    return IP
 
-# load default config if the json file is invalid 
-def load_or_initialize_config():
+
+def load_or_initialize_config(path=PICO_CONFIG_PATH):
     default_config = {
         'WIFI_SSID': 'your_wifi_ssid',
         'WIFI_PASSWORD': 'your_wifi_password',
@@ -66,56 +131,103 @@ def load_or_initialize_config():
         'PORT': TCP_PORT,
         'PICO_ID': '1'
     }
-    if os.path.exists(PICO_CONFIG_PATH):
+    if os.path.exists(path):
         try:
-            with open(PICO_CONFIG_PATH, 'r') as file:
-                return json.load(file)
+            with open(path) as fh:
+                return json.load(fh)
         except json.JSONDecodeError:
             return default_config
-    else:
-        return default_config
+    return default_config
 
-# Update or create config.json with current network settings and PICO_ID.
-def update_config_json(pico_serial_id):
-    ssid, wifi_password = get_wifi_ssid_pswd(get_wifi_ssid())
-    ip_address = get_ip_address()
 
-    config_data = load_or_initialize_config()
+def wait_for_network(run=run, timeout=30, sleep=time.sleep):
+    """At boot, udev fires for a Pico that was already plugged in before WiFi
+    is up, and the deployer used to write placeholders for everything. Give the
+    network a little time; give up after `timeout` seconds and warn."""
+    end = time.monotonic() + timeout
+    while True:
+        ssid, psk, source = get_wifi_credentials(run)
+        ip_address = get_ip_address()
+        if (ssid and psk and ip_address) or time.monotonic() >= end:
+            return ssid, psk, source, ip_address
+        sleep(2)
+
+
+def update_config_json(pico_serial_id, path=PICO_CONFIG_PATH, run=run, timeout=30):
+    """Fill config.json with this Pi's WiFi and IP. Values that cannot be
+    discovered are left as they were, so a hand-edited file keeps working."""
+    ssid, psk, source, ip_address = wait_for_network(run, timeout)
+    config_data = load_or_initialize_config(path)
 
     if ssid:
         config_data['WIFI_SSID'] = ssid
-
-    if wifi_password:
-        config_data['WIFI_PASSWORD'] = wifi_password
-
+    if psk:
+        config_data['WIFI_PASSWORD'] = psk
     if ip_address:
         config_data['IP_ADDRESS'] = ip_address
-
     config_data['PORT'] = TCP_PORT
     config_data['PICO_ID'] = str(pico_serial_id)
 
-    with open(PICO_CONFIG_PATH, 'w') as file:
-        json.dump(config_data, file, indent=4)
+    with open(path, 'w') as fh:
+        json.dump(config_data, fh, indent=4)
 
-# Transfer the prepared script to the connected Pico.
+    log_message(f'config.json: ssid={ssid or "UNKNOWN"} psk={"set" if psk else "UNKNOWN"} '
+                f'(via {source}) ip={ip_address or "UNKNOWN"} pico_id={pico_serial_id}')
+    if not (ssid and psk):
+        log_message('WARNING: WiFi credentials not found on this Pi; the Pico will not be able to join WiFi')
+    if not ip_address:
+        log_message('WARNING: no network route yet; config.json has no usable IP_ADDRESS')
+    return bool(ssid and psk and ip_address)
+
+
 def transfer_script_to_pico(port):
-    # Transfer main.py, config.json to the pico using rshell
+    """Copy main.py and config.json onto the Pico. True only if rshell succeeded."""
     try:
-        subprocess.check_call(['/home/project/myenv/bin/rshell', '-p', port, 'cp', PICO_MAIN_PATH, PICO_CONFIG_PATH, '/pyboard/'])
-    except subprocess.CalledProcessError as e:
-        log_message(f'Error during transfer: {str(e)}')
+        subprocess.check_call([RSHELL, '-p', port, 'cp', PICO_MAIN_PATH, PICO_CONFIG_PATH, '/pyboard/'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError) as err:
+        log_message(f'Error during transfer to {port}: {err}')
+        log_message('Pico scripts NOT deployed')
+        return False
+    log_message('Pico scripts deployed :)')
+    return True
+
+
+def reset_pico(port):
+    """rshell leaves the board at the REPL with main.py interrupted, so a freshly
+    provisioned Pico would sit idle until someone replugged it. A Ctrl-D soft
+    reset makes it run the files that were just copied."""
+    try:
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as err:
+        log_message(f'could not open {port} to reset the Pico: {err}')
+        return False
+    try:
+        tty.setraw(fd)
+        os.write(fd, b'\r\x04')
+    except OSError as err:
+        log_message(f'could not reset the Pico: {err}')
+        return False
     finally:
-        log_message(f'{datetime.datetime.now()} Pico Scripts deployed :)')
+        os.close(fd)
+    log_message('Pico reset; main.py is starting')
+    return True
+
 
 def main():
+    if len(sys.argv) < 5:
+        log_message(f'usage: {sys.argv[0]} DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT (got {sys.argv[1:]})')
+        return 2
     devname = sys.argv[1]
-    # id_vendor_id = sys.argv[2]
-    # id_model_id = sys.argv[3]
     pico_serial_id = sys.argv[4]
-    
-    log_message(f'{datetime.datetime.now()} Pico detected - Port: {devname}, ID: {pico_serial_id}')
-    update_config_json(pico_serial_id)
-    transfer_script_to_pico(devname)
 
-if __name__ == "__main__":
-    main()
+    log_message(f'Pico detected - Port: {devname}, ID: {pico_serial_id}')
+    update_config_json(pico_serial_id)
+    if not transfer_script_to_pico(devname):
+        return 1
+    reset_pico(devname)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
