@@ -3,7 +3,7 @@ import socket
 import time
 import json
 from machine import UART, Pin, WDT
-from net_util import safe_decode, Backoff
+from net_util import safe_decode, Backoff, HeartbeatMonitor, is_heartbeat_reply
 
 # Load network configuration
 def read_config():
@@ -86,13 +86,16 @@ def send_hello_packet(sock):
     print(f"[TCP] Sending hello: {msg}")
     sock.send(msg.encode())
 
-HEARTBEAT_INTERVAL = 10  # seconds
+HEARTBEAT_INTERVAL = 10   # seconds between PINGs
+HEARTBEAT_TIMEOUT = 5     # seconds to wait for one PONG (was 2, too tight for this wifi)
+HEARTBEAT_MAX_MISSES = 3  # consecutive misses before we call the connection dead
 last_heartbeat = 0
 
 while True:
     s = create_tcp_connection()
     send_hello_packet(s)
     last_heartbeat = time.time()
+    heartbeat = HeartbeatMonitor(HEARTBEAT_MAX_MISSES)
 
     try:
         while True:
@@ -124,10 +127,17 @@ while True:
                     raise Exception("Server closed connection")
                 if data:
                     cmd = safe_decode(data)
-                    print(f"[TCP] Command received: '{cmd}'")
-                    uart1.write(cmd)
-                    print(f"[UART] Sent to UART: '{cmd}'")
-                    blink_led()
+                    if is_heartbeat_reply(cmd):
+                        # A PONG that arrived after its PING timed out. It is
+                        # protocol traffic, not something the serial device
+                        # said, so it must not be written to the UART.
+                        print("[TCP] Late PONG, ignoring")
+                        heartbeat.pong()
+                    else:
+                        print(f"[TCP] Command received: '{cmd}'")
+                        uart1.write(cmd)
+                        print(f"[UART] Sent to UART: '{cmd}'")
+                        blink_led()
             except OSError as e:
                 if getattr(e, 'errno', None) not in (11, 35):  # not EAGAIN/EWOULDBLOCK
                     print(f"[TCP] Recv error: {e}")
@@ -138,26 +148,39 @@ while True:
             finally:
                 s.setblocking(True)
 
-            # Send heartbeat ping
+            # Send heartbeat ping. A lost PONG is not a lost connection: this
+            # wifi drops packets, and dropping the socket on the first miss
+            # made the board reconnect every ~40s all day.
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                last_heartbeat = now
+                pong = None
+                err = None
                 try:
                     s.send(b'PING')
                     print("[TCP] Sent heartbeat: PING")
-                    s.settimeout(2)
+                    s.settimeout(HEARTBEAT_TIMEOUT)
+                    wdt.feed()   # the recv below can block for HEARTBEAT_TIMEOUT
                     pong = s.recv(64)
-                    if pong:
-                        pong_msg = safe_decode(pong).strip()
-                        print(f"[TCP] Heartbeat response: '{pong_msg}'")
-                        if pong_msg.upper() != "PONG":
-                            raise Exception("Unexpected heartbeat response")
-                    else:
-                        raise Exception("No heartbeat response")
                 except Exception as e:
-                    print(f"[TCP] Heartbeat failed: {e}")
-                    raise
+                    err = e
                 finally:
                     s.settimeout(None)
-                    last_heartbeat = now
+
+                if pong == b'':
+                    # Not a lost packet: the server really did hang up.
+                    print("[TCP] Server closed the connection during heartbeat")
+                    raise OSError('server closed the connection')
+
+                reply = safe_decode(pong).strip() if pong else ''
+                if err is None and is_heartbeat_reply(reply):
+                    heartbeat.pong()
+                    print(f"[TCP] Heartbeat response: '{reply}'")
+                else:
+                    reason = err if err is not None else f"unexpected reply '{reply}'"
+                    if heartbeat.missed():
+                        print(f"[TCP] Heartbeat missed {heartbeat.misses} times in a row, reconnecting: {reason}")
+                        raise OSError('heartbeat lost')
+                    print(f"[TCP] Heartbeat missed {heartbeat.misses}/{HEARTBEAT_MAX_MISSES}, keeping the connection: {reason}")
 
             time.sleep(0.05)
 
