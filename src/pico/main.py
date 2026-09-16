@@ -3,6 +3,7 @@ import socket
 import select
 import time
 import json
+import machine
 from machine import UART, Pin, WDT
 from net_util import safe_decode, send_all, split_pongs, Backoff, HeartbeatMonitor
 
@@ -61,20 +62,57 @@ def blink_led():
     led.on()
     time.sleep(0.1)
 
-# Connect to Wi-Fi. wdt.feed() here too: on a very slow join, the loop below
-# would otherwise not run for long enough to feed the watchdog in time.
+# WiFi. The original firmware called wlan.connect() once, unguarded. On the
+# very first boot after a flash the CYW43 radio is not ready yet and that call
+# throws OSError EPERM every time (seen on two boards, 2026-09-11), leaving
+# the board frozen at the REPL. A soft reset does not clear the radio; only a
+# hardware reset does. So: retry with backoff, and if the radio still will not
+# join after WIFI_RESET_AFTER attempts, reset the hardware ourselves.
+WIFI_JOIN_TIMEOUT = 20    # seconds to wait for one join attempt to complete
+WIFI_RESET_AFTER = 5      # failed joins in a row before a hardware reset
+
 wlan = network.WLAN(network.STA_IF)
-wlan.active(True)
-print(f"[WiFi] Connecting to SSID: {WIFI_SSID}")
-wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-wifi_attempts = 0
-while not wlan.isconnected():
-    wdt.feed()
-    blink_led()
-    wifi_attempts += 1
-    print(f"[WiFi] Waiting for connection... attempt {wifi_attempts}")
-print(f"[WiFi] Connected! IP: {wlan.ifconfig()[0]}")
-led.off()
+wifi_backoff = Backoff(base=1, cap=30)
+
+def connect_wifi():
+    """Join WiFi, however long it takes. Returns only once connected."""
+    failures = 0
+    while True:
+        wdt.feed()
+        try:
+            wlan.active(True)
+            print(f"[WiFi] Connecting to SSID: {WIFI_SSID}")
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            deadline = time.time() + WIFI_JOIN_TIMEOUT
+            while not wlan.isconnected():
+                status = wlan.status()
+                if status < 0:
+                    # STAT_CONNECT_FAIL / STAT_NO_AP_FOUND / STAT_WRONG_PASSWORD
+                    raise OSError(f"join failed, status {status}")
+                if time.time() > deadline:
+                    raise OSError("join timed out")
+                wdt.feed()
+                blink_led()
+            print(f"[WiFi] Connected! IP: {wlan.ifconfig()[0]}")
+            led.off()
+            wifi_backoff.reset()
+            return
+        except Exception as e:
+            failures += 1
+            print(f"[WiFi] Join attempt {failures} failed: {e}")
+            if failures >= WIFI_RESET_AFTER:
+                print("[WiFi] Radio will not join; hardware reset")
+                time.sleep(0.5)   # let the message leave the UART
+                machine.reset()
+            # Power the radio down between attempts: cheapest thing that
+            # might clear a wedged chip short of a full reset.
+            try: wlan.active(False)
+            except Exception: pass
+            delay = wifi_backoff.next()
+            print(f"[WiFi] Retrying in {delay} second(s)...")
+            sleep_fed(delay)
+
+connect_wifi()
 
 # Establish TCP connection to server. Backoff (1s, 2s, 4s ... capped at 30s)
 # instead of a fixed 5s retry, so a Pi that is down for a while does not get
@@ -85,6 +123,11 @@ def create_tcp_connection():
     attempt = 1
     while True:
         wdt.feed()
+        if not wlan.isconnected():
+            # WiFi dropped out from under us (AP rebooted, moved out of
+            # range). No point retrying TCP until it is back.
+            print("[WiFi] Link lost, rejoining before TCP")
+            connect_wifi()
         try:
             print(f"[TCP] Connecting to {IP_ADDRESS}:{TCP_PORT} (attempt {attempt})")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
