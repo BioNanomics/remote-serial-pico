@@ -3,6 +3,8 @@ const pty = require('node-pty');
 const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
+const F = require('./frame.js');
+const { PicoSession } = require('./session.js');
 
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
@@ -83,7 +85,10 @@ function handlePicoConnection(serialId, socket) {
         logger.info(`${picoName} tcp client connected`);
         setupPicoPty(picoName);
     }
-    picoDevices[picoName] = { socket };
+    // Keep the record: replacing it with a fresh object here dropped the pty
+    // that setupPicoPty() had just stored, so device responses never reached
+    // the pty (present on main since the heartbeat commit, 9e04e1c).
+    picoDevices[picoName].socket = socket;
     return picoName;
 }
 
@@ -175,73 +180,63 @@ function removeSymlink(picoName) {
     }
 }
 
-// Function to handle data received from pty and send it to the socket
+// Bytes written to the pty go to the board inside DATA frames, exactly as
+// written: the pty is byte-transparent, so no trimming and no added
+// terminator. node-pty hands us strings; convert back to the raw bytes.
 function routePtyCmdToSocket(picoName) {
     const myPty = picoDevices[picoName].pty;
     myPty.on('data', (data) => {
-        const command = data.toString();
-        picoDevices[picoName].socket.write(command);
-        logger.info(`command to ${picoName}: ${command}`);
+        const device = picoDevices[picoName];
+        if (!device || !device.session) {
+            return;
+        }
+        const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data, 'binary');
+        device.session.sendData(bytes);
+        logger.info(`command to ${picoName}: ${JSON.stringify(bytes.toString('latin1'))}`);
     });
 }
 
-// Function to write response received from socket to the pty
-function writePicoRespToPty(picoName, response) {
-    const myPty = picoDevices[picoName].pty;
+// A DATA payload from the board goes to the pty exactly as the device sent it.
+function writePicoRespToPty(picoName, payload) {
+    const myPty = picoDevices[picoName] && picoDevices[picoName].pty;
     if (myPty) {
-        myPty.write(response + '\r');
-        logger.info(`Response from ${picoName}: ${response}`);
+        myPty.write(payload.toString('latin1'));
+        logger.info(`Response from ${picoName}: ${JSON.stringify(payload.toString('latin1'))}`);
     }
 }
 
-// The Pico sends 'pico_<serialId>' and 'PING' without any terminator, so TCP is
-// free to coalesce them with the device data that follows. Match the tokens
-// exactly instead of assuming a packet holds nothing else.
-const REGISTRATION_PATTERN = /^pico_([0-9a-fA-F]{16})/;
-const HEARTBEAT = 'PING';
-
-// TCP server to listen for connections from Pico devices
+// Every Pico connection speaks wire protocol v1 (docs/protocol.md). A
+// PicoSession per socket does the parsing and the protocol replies; this
+// handler only wires it to the socket, the device table and the pty.
 const server = net.createServer((socket) => {
     let picoName = null;
 
-    socket.on('data', (data) => {
-        let message = data.toString();
-
-        // Registration: consume only the 'pico_<serialId>' token. Anything after it
-        // is device data, not part of the serial id.
-        const registration = REGISTRATION_PATTERN.exec(message);
-        if (registration) {
-            picoName = handlePicoConnection(registration[1], socket);
-            message = message.slice(registration[0].length);
-        } else if (message.startsWith('pico_')) {
-            logger.warn(`Ignoring malformed registration packet: ${JSON.stringify(message)}`);
-            return;
-        }
-
-        // 💓 Heartbeat: respond to PING with PONG, once per PING in the packet
-        const segments = message.split(HEARTBEAT);
-        if (segments.length > 1) {
-            for (let i = 1; i < segments.length; i++) {
-                socket.write('PONG\n');
-            }
-            logger.info(`Heartbeat received from ${picoName || 'unknown'} -> Responded with PONG`);
-            message = segments.join('');
-        }
-
-        const response = message.trim();
-        if (picoName && response) {
-            writePicoRespToPty(picoName, response);
-        }
+    const session = new PicoSession({
+        send: (buf) => { if (!socket.destroyed) socket.write(buf); },
+        close: () => socket.end(),
+        log: (level, msg) => logger[level](msg),
+        register: (serialId, info) => {
+            picoName = handlePicoConnection(serialId, socket);
+            picoDevices[picoName].session = session;
+            picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs
+            return picoName;
+        },
+        onData: (payload) => writePicoRespToPty(picoName, payload),
     });
+
+    socket.on('data', (data) => session.receive(data));
 
     socket.on('close', () => {
         if (picoName) {
             logger.warn(`${picoName} socket close event triggered; ignored this event`);
+            if (picoDevices[picoName] && picoDevices[picoName].session === session) {
+                picoDevices[picoName].session = null;
+            }
         }
     });
 
     socket.on('error', (err) => {
-        logger.error('Socket error:', err);
+        logger.error(`Socket error${picoName ? ` (${picoName})` : ''}: ${err.message}`);
     });
 });
 
