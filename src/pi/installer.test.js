@@ -41,9 +41,10 @@ function ctxIn(dir, extra = {}) {
 
 test('renderConfig has every key PtyServer reads, pointed at the project dir', () => {
     const y = I.parseFlatYaml(I.renderConfig({ ...I.DEFAULTS, projectDir: '/home/project' }));
-    assert.deepStrictEqual(Object.keys(y).sort(), ['CustomlogDir', 'PicoSerialMap', 'SyslogDir', 'TCP_PORT', 'symlinkDir']);
+    assert.deepStrictEqual(Object.keys(y).sort(), ['AcceptLegacyPicos', 'CustomlogDir', 'PicoSerialMap', 'SyslogDir', 'TCP_PORT', 'symlinkDir']);
     assert.strictEqual(y.symlinkDir, '/home/project');
     assert.strictEqual(y.TCP_PORT, 50000);
+    assert.strictEqual(y.AcceptLegacyPicos, 'true', 'a fresh install must keep serving v0 boards during the cutover');
 });
 
 test('renderUnit is host-specific in exactly the two places the README says', () => {

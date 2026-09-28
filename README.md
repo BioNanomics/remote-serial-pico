@@ -104,6 +104,7 @@ symlinkDir: '/home/project'
 SyslogDir: '/dev/log'
 CustomlogDir: '/tmp/smartHome.log'
 TCP_PORT: 50000
+AcceptLegacyPicos: true
 ```
 
 | Key | Meaning |
@@ -113,6 +114,7 @@ TCP_PORT: 50000
 | `SyslogDir` | Unix syslog socket, normally `/dev/log` |
 | `CustomlogDir` | Plain-text application log |
 | `TCP_PORT` | Port the Picos connect to. Must match `PORT` in the Pico's `config.json` |
+| `AcceptLegacyPicos` | Keep serving boards that still run the old unframed firmware while they are redeployed one by one. Missing counts as `true`. Set `false` when the log no longer shows "v0 firmware" warnings. See [docs/protocol.md](./docs/protocol.md), "Cutover from v0" |
 
 **4. Install the udev rule** so plugging in a Pico deploys the client code.
 
