@@ -2,8 +2,9 @@
 Python interpreter, with no MicroPython, no hardware, no network.
 
 MicroPython-safe: stdlib only, no f-strings in hot loops here (none needed),
-no type hints.
+no type hints. Imports frame.py, so the deployer copies both.
 """
+import frame
 
 
 def safe_decode(data):
@@ -61,29 +62,6 @@ class Backoff:
         return delay
 
 
-PONG = 'PONG'
-
-
-def split_pongs(text):
-    """Separate heartbeat replies from device data in one received chunk.
-
-    Returns (number_of_pongs, remaining_text). The server answers each PING
-    with 'PONG\\n' and nothing stops TCP from delivering that in the same
-    chunk as a command for the serial device. A PONG is protocol traffic,
-    not something the device should ever see, so it must never reach the
-    UART -- but the command travelling with it must.
-    """
-    pongs = text.count(PONG + '\n')
-    rest = text.replace(PONG + '\n', '')
-    if rest.strip().upper() == PONG:
-        # a bare PONG with no newline, from an older server
-        pongs += 1
-        rest = ''
-    if pongs and not rest.strip():
-        rest = ''
-    return pongs, rest
-
-
 class HeartbeatMonitor:
     """Decides when to PING, and when a silent server means the link is gone.
 
@@ -134,3 +112,144 @@ class HeartbeatMonitor:
         """Record a missed PONG. True if the connection should now be dropped."""
         self.misses += 1
         return self.misses >= self.max_misses
+
+
+def file_hash_prefix(path, length=16, chunk=512):
+    """First `length` hex characters of SHA-256 over a file, or 'unknown'.
+
+    Goes into REGISTER as `hash`, so the Pi can tell which main.py a board is
+    actually running and Phase F can compare it with the canonical file. Read
+    in small chunks: main.py is bigger than any buffer worth holding whole on
+    a board with 264 KB of RAM.
+    """
+    try:
+        import hashlib
+        import binascii
+        h = hashlib.sha256()
+        with open(path, 'rb') as fh:
+            while True:
+                block = fh.read(chunk)
+                if not block:
+                    break
+                h.update(block)
+        return binascii.hexlify(h.digest()).decode()[:length]
+    except Exception:
+        return 'unknown'
+
+
+class RegistrationRefused(OSError):
+    """The Pi answered REGISTER with ok=false. Retrying quickly will not help."""
+
+
+class PicoLink:
+    """The Pico's side of wire protocol v1 (docs/protocol.md). No I/O.
+
+    main.py owns the socket. It asks this class for the bytes to send
+    (register_frame, ping_frame, data_frames) and feeds it whatever the
+    socket returns; receive() answers with a list of (kind, value) events:
+
+      ('registered', name)      REGISTER_ACK ok=true; DATA may flow now
+      ('refused', reason)       REGISTER_ACK ok=false; the Pi will close
+      ('data', bytes)           payload of a DATA frame, for the UART
+      ('pong', None)            the server answered our PING
+      ('send', bytes)           a protocol reply to put on the socket
+      ('error', (code, msg))    the server reported an ERROR
+      ('ignored', opcode)       a later-phase opcode this firmware skips
+      ('close', reason)         give up on this connection
+
+    Only 'data' events ever reach the UART: that is the data path rule.
+    """
+
+    def __init__(self, pico_id, fw, main_hash):
+        self.pico_id = pico_id
+        self.fw = fw
+        self.main_hash = main_hash
+        self.registered = False
+        self.name = None
+        self.server_time = None
+        self._decoder = frame.Decoder()
+        self._seq = frame.Sequencer()
+
+    @property
+    def resyncs(self):
+        return self._decoder.resyncs
+
+    # --- frames to send -----------------------------------------------------
+
+    def _frame(self, opcode, payload=b''):
+        return frame.encode(opcode, self._seq.next(), payload)
+
+    def _json(self, opcode, obj):
+        return frame.encode_json(opcode, self._seq.next(), obj)
+
+    def register_frame(self):
+        """The first frame on every connection."""
+        return self._json(frame.OP_REGISTER,
+                          {'id': self.pico_id, 'fw': self.fw, 'hash': self.main_hash})
+
+    def ping_frame(self):
+        return self._frame(frame.OP_PING)
+
+    def error_frame(self, code, msg):
+        return self._json(frame.OP_ERROR, {'code': code, 'msg': msg})
+
+    def data_frames(self, data):
+        """UART bytes as DATA frames, split so none exceeds MAX_PAYLOAD.
+
+        Empty until registered: the spec forbids DATA before REGISTER_ACK.
+        main.py leaves the bytes in the UART buffer until then.
+        """
+        if not self.registered or not data:
+            return []
+        out = []
+        for i in range(0, len(data), frame.MAX_PAYLOAD):
+            out.append(self._frame(frame.OP_DATA, data[i:i + frame.MAX_PAYLOAD]))
+        return out
+
+    # --- bytes received -----------------------------------------------------
+
+    def receive(self, chunk):
+        events = []
+        before = self._decoder.version_errors
+        frames = self._decoder.feed(chunk)
+        if self._decoder.version_errors > before:
+            events.append(('send', self.error_frame(
+                frame.ERR_VERSION, 'only protocol version %d is supported' % frame.VERSION)))
+            events.append(('close', 'server sent an unsupported protocol version'))
+            return events
+        for f in frames:
+            self._handle(f, events)
+        return events
+
+    def _handle(self, f, events):
+        op = f.opcode
+        if op == frame.OP_REGISTER_ACK:
+            ack = frame.decode_json(f.payload)
+            if ack is None:
+                events.append(('send', self.error_frame(frame.ERR_BAD_PAYLOAD, 'REGISTER_ACK is not JSON')))
+            elif ack.get('ok'):
+                self.registered = True
+                self.name = ack.get('name')
+                self.server_time = ack.get('time')
+                events.append(('registered', self.name))
+            else:
+                events.append(('refused', ack.get('reason', 'no reason given')))
+        elif op == frame.OP_DATA:
+            if self.registered:
+                events.append(('data', f.payload))
+            else:
+                events.append(('send', self.error_frame(frame.ERR_NOT_REGISTERED, 'not registered yet')))
+        elif op == frame.OP_PONG:
+            events.append(('pong', None))
+        elif op == frame.OP_PING:
+            events.append(('send', self._frame(frame.OP_PONG)))
+        elif op == frame.OP_ERROR:
+            err = frame.decode_json(f.payload) or {}
+            events.append(('error', (err.get('code'), err.get('msg'))))
+        elif op in frame.KNOWN_OPCODES:
+            # Assigned to a later phase (auth, control, update): nothing to
+            # do yet, and not an error, so the server is free to probe.
+            events.append(('ignored', op))
+        else:
+            events.append(('send', self.error_frame(
+                frame.ERR_UNKNOWN_OPCODE, 'unknown opcode 0x%02x' % op)))
