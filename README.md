@@ -221,8 +221,9 @@ run it by hand for a specific device: `sudo python3 src/pi/PicoFirmwareFlasher.p
 With MicroPython on board, just plug the Pico into the Pi's USB port. The udev
 rule fires [PicoScriptDeployer.py](./src/pi/PicoScriptDeployer.py), which:
 
-1. Reads the Pi's current SSID (`iwgetid`), the matching WiFi password from
-   NetworkManager, and the Pi's current IP address.
+1. Reads the Pi's WiFi name and password (from NetworkManager via `nmcli`, or
+   from `/etc/hostapd/hostapd.conf` if the Pi hosts the Picos' access point
+   itself) and the Pi's address on `wlan0`, which is the one a Pico can reach.
 2. Writes those plus the Pico's USB serial number into [src/pico/config.json](./src/pico/config.json).
 3. Uses `rshell` to copy `config.json` and [main.py](./src/pico/main.py) onto the board.
 

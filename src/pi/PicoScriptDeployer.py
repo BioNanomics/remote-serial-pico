@@ -4,6 +4,12 @@ device. Run by 99-pico.rules with: DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SH
 
 Before writing config.json it fills in the Pi's own WiFi name and password and
 its IP address, so the Pico can reach PtyServer without anyone editing a file.
+
+The Pi may be a plain WiFi client (the original setup) or it may host its own
+access point for the Picos while it talks to the rest of the world over
+Ethernet. Both cases are handled: credentials come from NetworkManager if it
+knows them and from hostapd.conf if it does not, and the address handed to the
+Pico is the one on the WiFi interface, which is the only one a Pico can reach.
 """
 import datetime
 import json
@@ -19,6 +25,8 @@ PICO_MAIN_PATH = '/home/project/remote-serial-pico/src/pico/main.py'
 PICO_CONFIG_PATH = '/home/project/remote-serial-pico/src/pico/config.json'
 RSHELL = '/home/project/myenv/bin/rshell'
 NM_KEYFILE_DIR = '/etc/NetworkManager/system-connections'
+HOSTAPD_CONF = '/etc/hostapd/hostapd.conf'
+WIFI_INTERFACE = 'wlan0'   # the interface the Picos are on, client or AP
 LOG_PATH = '/tmp/deployer.log'
 
 TCP_PORT = 50000
@@ -39,13 +47,16 @@ def run(cmd):
 
 # --- WiFi credentials --------------------------------------------------------
 #
-# Two ways, tried in order:
+# Three ways, tried in order:
 #   1. nmcli, which NetworkManager ships on every Pi OS since Bookworm. It works
 #      whatever the connection file is called, which matters on images made by
 #      Raspberry Pi Imager or cloud-init, where the file is not named after the
 #      SSID and `iwgetid` is not installed.
 #   2. The old way: `iwgetid -r` for the SSID, then a keyfile that either is
 #      named after the SSID or contains a matching `ssid=` line.
+#   3. hostapd.conf, for a Pi that hosts the Picos' WiFi itself. NetworkManager
+#      is told to leave that interface alone, so nmcli and iwgetid both see
+#      nothing there; the SSID and passphrase live only in hostapd's own file.
 
 def _nm_unescape(value):
     return value.replace('\\:', ':').replace('\\\\', '\\')
@@ -101,18 +112,59 @@ def wifi_credentials_from_files(run=run, keyfile_dir=NM_KEYFILE_DIR):
     return ssid, None
 
 
-def get_wifi_credentials(run=run):
+def wifi_credentials_from_hostapd(path=HOSTAPD_CONF):
+    """SSID and passphrase of the access point this Pi runs, if it runs one."""
+    ssid = psk = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                key, sep, value = line.partition('=')
+                if not sep:
+                    continue
+                key = key.strip()
+                value = value.strip()
+                if key == 'ssid':
+                    ssid = value
+                elif key == 'wpa_passphrase':
+                    psk = value
+    except OSError:
+        return None, None
+    return ssid or None, psk or None
+
+
+def get_wifi_credentials(run=run, hostapd_conf=HOSTAPD_CONF):
     ssid, psk = wifi_credentials_from_nmcli(run)
     if ssid and psk:
         return ssid, psk, 'nmcli'
     f_ssid, f_psk = wifi_credentials_from_files(run)
-    return (ssid or f_ssid), (psk or f_psk), 'keyfile'
+    if (ssid or f_ssid) and (psk or f_psk):
+        return (ssid or f_ssid), (psk or f_psk), 'keyfile'
+    h_ssid, h_psk = wifi_credentials_from_hostapd(hostapd_conf)
+    if h_ssid and h_psk:
+        return h_ssid, h_psk, 'hostapd'
+    return (ssid or f_ssid or h_ssid), (psk or f_psk or h_psk), 'keyfile'
 
 
 # --- the rest ----------------------------------------------------------------
 
-def get_ip_address():
-    """The address the Pico should connect to: whichever interface routes out."""
+def ip_address_of(interface, run=run):
+    """The IPv4 address on one interface, or None if it has none."""
+    out = run(['ip', '-4', '-o', 'addr', 'show', 'dev', interface])
+    if not out:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if 'inet' in parts:
+            addr = parts[parts.index('inet') + 1]
+            return addr.split('/')[0]
+    return None
+
+
+def ip_address_with_default_route():
+    """Whichever interface routes to the internet. Needs no traffic to leave."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
@@ -121,6 +173,19 @@ def get_ip_address():
         return None
     finally:
         s.close()
+
+
+def get_ip_address(run=run, interface=WIFI_INTERFACE):
+    """The address the Pico should connect to.
+
+    Prefer the WiFi interface's own address. The old rule, "whichever
+    interface routes to the internet", picked the Ethernet address on a Pi
+    that is wired for its own uplink and hosts a WiFi access point for the
+    Picos: the AP interface has no default route, so it never won. A Pico on
+    that access point cannot reach the wired address at all. The route trick
+    stays as the fallback for a Pi with no address on WIFI_INTERFACE.
+    """
+    return ip_address_of(interface, run) or ip_address_with_default_route()
 
 
 def load_or_initialize_config(path=PICO_CONFIG_PATH):

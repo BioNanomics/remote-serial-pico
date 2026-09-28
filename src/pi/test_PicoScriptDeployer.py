@@ -57,6 +57,64 @@ class TestKeyfileFallback(unittest.TestCase):
             self.assertEqual(D.wifi_credentials_from_files(run, keyfile_dir=d), ('mieweb-corp', None))
 
 
+class TestHostapdFallback(unittest.TestCase):
+
+    def _conf(self, d, text):
+        path = os.path.join(d, 'hostapd.conf')
+        with open(path, 'w') as fh:
+            fh.write(text)
+        return path
+
+    def test_reads_ssid_and_passphrase_ignoring_comments_and_blanks(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._conf(d, '# the Picos\' own network\ninterface=wlan0\n\nssid=PicoNet\n'
+                                 'wpa=2\nwpa_passphrase=pico-secret\n#ssid=commented-out\n')
+            self.assertEqual(D.wifi_credentials_from_hostapd(path), ('PicoNet', 'pico-secret'))
+
+    def test_missing_file_means_none(self):
+        self.assertEqual(D.wifi_credentials_from_hostapd('/nonexistent/hostapd.conf'), (None, None))
+
+    def test_open_network_has_no_passphrase(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._conf(d, 'ssid=OpenNet\n')
+            self.assertEqual(D.wifi_credentials_from_hostapd(path), ('OpenNet', None))
+
+    def test_hostapd_is_used_only_when_nmcli_and_keyfiles_know_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._conf(d, 'ssid=PicoNet\nwpa_passphrase=pico-secret\n')
+            with mock.patch.object(D, 'NM_KEYFILE_DIR', d):
+                # AP-mode interface: nmcli lists no wireless connection, iwgetid sees nothing
+                self.assertEqual(D.get_wifi_credentials(fake_run({}), hostapd_conf=path),
+                                 ('PicoNet', 'pico-secret', 'hostapd'))
+                # but a real client connection still wins
+                run = fake_run({
+                    ('nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'): 'x:802-11-wireless',
+                    ('nmcli', '-g', '802-11-wireless.ssid', 'connection', 'show', 'x'): 'mieweb-corp',
+                    ('nmcli', '-s', '-g', '802-11-wireless-security.psk', 'connection', 'show', 'x'): 'secret',
+                })
+                self.assertEqual(D.get_wifi_credentials(run, hostapd_conf=path), ('mieweb-corp', 'secret', 'nmcli'))
+
+
+class TestIpAddress(unittest.TestCase):
+
+    IP_WLAN0 = ('ip', '-4', '-o', 'addr', 'show', 'dev', 'wlan0')
+
+    def test_prefers_the_wifi_interface_over_the_default_route(self):
+        run = fake_run({self.IP_WLAN0: '3: wlan0    inet 10.42.0.1/24 brd 10.42.0.255 scope global noprefixroute wlan0\\       valid_lft forever preferred_lft forever'})
+        with mock.patch.object(D, 'ip_address_with_default_route', lambda: '10.3.177.167'):
+            self.assertEqual(D.get_ip_address(run), '10.42.0.1')
+
+    def test_falls_back_to_the_default_route_when_wifi_has_no_address(self):
+        for output in (None, '', '3: wlan0    <BROADCAST,MULTICAST> mtu 1500'):
+            run = fake_run({self.IP_WLAN0: output})
+            with mock.patch.object(D, 'ip_address_with_default_route', lambda: '10.3.177.167'):
+                self.assertEqual(D.get_ip_address(run), '10.3.177.167', repr(output))
+
+    def test_none_when_nothing_has_an_address_yet(self):
+        with mock.patch.object(D, 'ip_address_with_default_route', lambda: None):
+            self.assertIsNone(D.get_ip_address(fake_run({})))
+
+
 class TestWaitForNetwork(unittest.TestCase):
 
     def test_returns_as_soon_as_everything_is_known(self):
