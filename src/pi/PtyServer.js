@@ -3,8 +3,7 @@ const pty = require('node-pty');
 const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
-const F = require('./frame.js');
-const { PicoSession } = require('./session.js');
+const { sessionFor } = require('./legacy.js');
 
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
@@ -205,26 +204,44 @@ function writePicoRespToPty(picoName, payload) {
     }
 }
 
-// Every Pico connection speaks wire protocol v1 (docs/protocol.md). A
-// PicoSession per socket does the parsing and the protocol replies; this
-// handler only wires it to the socket, the device table and the pty.
+// A Pico connection speaks wire protocol v1 (docs/protocol.md), or, until
+// every board in the building has been redeployed, the old unframed v0. The
+// first byte decides which session handles the socket (see legacy.js and the
+// spec's "Cutover from v0"). The session does the parsing and the protocol
+// replies; this handler only wires it to the socket, the device table and the
+// pty. AcceptLegacyPicos missing from config.yaml counts as true.
+const acceptLegacy = config.AcceptLegacyPicos !== false;
+
 const server = net.createServer((socket) => {
     let picoName = null;
+    let session = null;
+    const peer = `${socket.remoteAddress}:${socket.remotePort}`;
 
-    const session = new PicoSession({
+    const hooks = {
         send: (buf) => { if (!socket.destroyed) socket.write(buf); },
         close: () => socket.end(),
         log: (level, msg) => logger[level](msg),
         register: (serialId, info) => {
             picoName = handlePicoConnection(serialId, socket);
             picoDevices[picoName].session = session;
-            picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs
+            picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs; fw is 'v0' for a legacy board
             return picoName;
         },
         onData: (payload) => writePicoRespToPty(picoName, payload),
-    });
+    };
 
-    socket.on('data', (data) => session.receive(data));
+    socket.on('data', (data) => {
+        if (!session) {
+            session = sessionFor(data[0], hooks, { acceptLegacy });
+            if (!session) {
+                logger.warn(`${peer} does not speak wire protocol v1 and AcceptLegacyPicos is false; closing`);
+                socket.destroy();
+                return;
+            }
+            logger.info(`${peer} connected speaking protocol ${session.protocol}`);
+        }
+        session.receive(data);
+    });
 
     socket.on('close', () => {
         if (picoName) {
