@@ -224,7 +224,7 @@ rule fires [PicoScriptDeployer.py](./src/pi/PicoScriptDeployer.py), which:
 1. Reads the Pi's current SSID (`iwgetid`), the matching WiFi password from
    NetworkManager, and the Pi's current IP address.
 2. Writes those plus the Pico's USB serial number into [src/pico/config.json](./src/pico/config.json).
-3. Uses `rshell` to copy `config.json` and [main.py](./src/pico/main.py) onto the board.
+3. Uses `rshell` to copy `config.json`, [main.py](./src/pico/main.py), `net_util.py` and `frame.py` onto the board.
 
 It takes a few seconds. Watch it happen:
 
@@ -341,9 +341,9 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 * **Now, what's the role of the main code in Pico?**
     * Retrieves the network credentials and server details from the `config.json`.
-    * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
-    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other.
-    * Sends a heartbeat signal (`PING`) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` response from the server.
+    * Upon TCP connection, sends a `REGISTER` frame carrying its `Serial-ID`, its `FIRMWARE_VERSION` and a hash of its own `main.py`, and waits for the Pi's `REGISTER_ACK`. Every byte on the wire travels inside a frame; see [docs/protocol.md](./docs/protocol.md).
+    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other, unchanged, inside `DATA` frames.
+    * Sends a heartbeat (`PING` frame) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` frame back, and reconnects only after three misses in a row.
     * Reconnects automatically if the Pi closes the connection.
 
 ## Visual Overview
