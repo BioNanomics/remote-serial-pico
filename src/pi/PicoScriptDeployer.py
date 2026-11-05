@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Deploy main.py and config.json to a Pico that has just appeared as a serial
+"""Deploy main.py, net_util.py and config.json to a Pico that has just appeared as a serial
 device. Run by 99-pico.rules with: DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT.
 
 Before writing config.json it fills in the Pi's own WiFi name and password and
@@ -17,6 +17,7 @@ import tty
 
 PICO_MAIN_PATH = '/home/project/remote-serial-pico/src/pico/main.py'
 PICO_CONFIG_PATH = '/home/project/remote-serial-pico/src/pico/config.json'
+PICO_NET_UTIL_PATH = '/home/project/remote-serial-pico/src/pico/net_util.py'
 RSHELL = '/home/project/myenv/bin/rshell'
 NM_KEYFILE_DIR = '/etc/NetworkManager/system-connections'
 LOG_PATH = '/tmp/deployer.log'
@@ -181,9 +182,14 @@ def update_config_json(pico_serial_id, path=PICO_CONFIG_PATH, run=run, timeout=3
 
 
 def transfer_script_to_pico(port):
-    """Copy main.py and config.json onto the Pico. True only if rshell succeeded."""
+    """Copy main.py, net_util.py and config.json onto the Pico. True only if rshell succeeded.
+
+    main.py imports net_util, so leaving it out is not a partial deploy --
+    it is a Pico that fails to boot at all.
+    """
     try:
-        subprocess.check_call([RSHELL, '-p', port, 'cp', PICO_MAIN_PATH, PICO_CONFIG_PATH, '/pyboard/'],
+        subprocess.check_call([RSHELL, '-p', port, 'cp',
+                               PICO_MAIN_PATH, PICO_NET_UTIL_PATH, PICO_CONFIG_PATH, '/pyboard/'],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError) as err:
         log_message(f'Error during transfer to {port}: {err}')
