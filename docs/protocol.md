@@ -205,5 +205,11 @@ frame.
 | Pico codec | `src/pico/frame.py` | `src/pico/test_frame.py` |
 | Pi codec | `src/pi/frame.js` | `src/pi/frame.test.js` |
 | Cross-check | both | `src/pi/interop.test.js` encodes in JS, decodes in Python |
-| Server | `src/pi/PtyServer.js` | |
-| Firmware | `src/pico/main.py` | desktop simulation |
+| Server | `src/pi/PtyServer.js` | `src/pi/session.test.js` (the protocol logic lives in `session.js`) |
+| Firmware protocol logic | `src/pico/net_util.py` (`PicoLink`) | `src/pico/test_net_util.py` |
+| Firmware | `src/pico/main.py` | `src/pi/firmware.sim.test.js` runs the real `main.py` on a desktop, via `tools/pico_sim/`, against a `PicoSession` |
+
+The desktop simulation swaps in stand-ins for MicroPython's `machine` and
+`network` modules only; sockets, `select.poll`, framing, registration, relay
+and reconnect all run unmodified. What it cannot prove is MicroPython's own
+socket and poll behaviour on a Pico W: that needs a board.
