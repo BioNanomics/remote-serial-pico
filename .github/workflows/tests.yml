@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Required checks must also run inside the merge queue, or merges wait forever.
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (node + python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Raspberry Pi OS trixie ships Node 20 and Python 3.13.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # No `npm ci`: the unit tests use only Node built-ins, and installing
+      # would compile node-pty for nothing. The install job covers that.
+      - name: node tests (installer, codec, sessions, firmware simulation)
+        run: npm test
+
+      - name: pico tests (frame, net_util)
+        run: python -m unittest discover -s src/pico -p 'test_*.py' -v
+
+      - name: pi python tests (flasher, deployer)
+        run: python -m unittest discover -s src/pi -p 'test_*.py' -v
+
+  install:
+    name: install on a clean Pi OS stand-in (arm64, systemd)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: install, re-install, doctor, relay, reboot, breakage
+        run: bash test/install/run.sh

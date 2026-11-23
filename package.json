@@ -5,6 +5,7 @@
   "main": "src/pi/installer.js",
   "scripts": {
     "test": "node --test src/pi/*.test.js",
+    "test:install": "bash test/install/run.sh",
     "start": "node src/pi/PtyServer.js"
   },
   "bin": {

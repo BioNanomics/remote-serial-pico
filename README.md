@@ -46,7 +46,7 @@ receives shows up on the pty.
 sudo apt update
 sudo apt install -y nodejs npm build-essential python3 python3-venv python3-pip
 sudo npm i -g remote-serial-pico
-remote-serial-pico i
+sudo remote-serial-pico i
 ```
 
 `remote-serial-pico i` (or `install`) does every step of "the manual way" below,
@@ -355,6 +355,31 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     ![drawing alt text](https://docs.google.com/drawings/d/1oIbP6EGNI4thhi0qzVgtGZw0lyD-F9gRc0-1tAc7O_Q/export/png)
 
     [![Watch the video](img/4.GIF)](https://youtu.be/M36LoMouvPg)
+
+## Tests
+
+```bash
+npm test                                                   # Node: installer, codec, sessions, firmware simulation
+python3 -m unittest discover -s src/pico -p 'test_*.py'    # Pico: frame, net_util
+python3 -m unittest discover -s src/pi -p 'test_*.py'      # Pi: flasher, deployer
+npm run test:install                                       # full install in a systemd container (needs Docker)
+```
+
+`test:install` ([test/install/run.sh](./test/install/run.sh)) boots a Debian
+trixie container under systemd as a stand-in for a fresh Raspberry Pi OS Lite
+image and follows "The quick way" above against this working tree. It checks
+that a second install changes nothing, `doctor` is green, the service is
+enabled and listening, nothing is world-writable, and a simulated Pico (using
+the firmware's own protocol code) gets a byte-exact pty in both directions. It
+then reboots the container, repeats the checks, and breaks things on purpose
+to make sure `doctor` notices. `KEEP=1` leaves the container running for a
+look around. Problems already tracked in
+[#19](https://github.com/BioNanomics/remote-serial-pico/issues/19) are reported
+as `KNOWN` rather than failing the run.
+
+It cannot exercise USB, udev events, BOOTSEL flashing, WiFi or a real board;
+that needs the hardware bench. GitHub Actions runs all of the above on every
+pull request ([.github/workflows/tests.yml](./.github/workflows/tests.yml)).
 
 ## Credits
 Special thanks to [Medical Informatics Engineering](https://www.mieweb.com/) for their support throughout the development of this project, especially to [Doug Horner](https://github.com/horner) for his invaluable guidance.
