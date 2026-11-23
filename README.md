@@ -104,6 +104,7 @@ symlinkDir: '/home/project'
 SyslogDir: '/dev/log'
 CustomlogDir: '/tmp/smartHome.log'
 TCP_PORT: 50000
+AcceptLegacyPicos: true
 ```
 
 | Key | Meaning |
@@ -113,6 +114,7 @@ TCP_PORT: 50000
 | `SyslogDir` | Unix syslog socket, normally `/dev/log` |
 | `CustomlogDir` | Plain-text application log |
 | `TCP_PORT` | Port the Picos connect to. Must match `PORT` in the Pico's `config.json` |
+| `AcceptLegacyPicos` | Keep serving boards that still run the old unframed firmware while they are redeployed one by one. Missing counts as `true`. Set `false` when the log no longer shows "v0 firmware" warnings. See [docs/protocol.md](./docs/protocol.md), "Cutover from v0" |
 
 **4. Install the udev rule** so plugging in a Pico deploys the client code.
 
@@ -225,7 +227,7 @@ rule fires [PicoScriptDeployer.py](./src/pi/PicoScriptDeployer.py), which:
    from `/etc/hostapd/hostapd.conf` if the Pi hosts the Picos' access point
    itself) and the Pi's address on `wlan0`, which is the one a Pico can reach.
 2. Writes those plus the Pico's USB serial number into [src/pico/config.json](./src/pico/config.json).
-3. Uses `rshell` to copy `config.json` and [main.py](./src/pico/main.py) onto the board.
+3. Uses `rshell` to copy `config.json`, [main.py](./src/pico/main.py), `net_util.py` and `frame.py` onto the board.
 
 It takes a few seconds. Watch it happen:
 
@@ -342,9 +344,9 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 * **Now, what's the role of the main code in Pico?**
     * Retrieves the network credentials and server details from the `config.json`.
-    * Upon TCP connection, sends its `Serial-ID` to the Pi in the first packet.
-    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other.
-    * Sends a heartbeat signal (`PING`) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` response from the server.
+    * Upon TCP connection, sends a `REGISTER` frame carrying its `Serial-ID`, its `FIRMWARE_VERSION` and a hash of its own `main.py`, and waits for the Pi's `REGISTER_ACK`. Every byte on the wire travels inside a frame; see [docs/protocol.md](./docs/protocol.md).
+    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other, unchanged, inside `DATA` frames.
+    * Sends a heartbeat (`PING` frame) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` frame back, and reconnects only after three misses in a row.
     * Reconnects automatically if the Pi closes the connection.
 
 ## Visual Overview

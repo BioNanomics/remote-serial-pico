@@ -5,7 +5,15 @@ import time
 import json
 import machine
 from machine import UART, Pin, WDT
-from net_util import safe_decode, send_all, split_pongs, Backoff, HeartbeatMonitor
+from net_util import (safe_decode, send_all, file_hash_prefix, Backoff,
+                      HeartbeatMonitor, PicoLink, RegistrationRefused)
+
+# Reported to the Pi in REGISTER (docs/protocol.md), together with a hash of
+# this very file, so `remote-serial-pico status` and the logs can say which
+# firmware each board runs without anyone walking over to it. Bump on every
+# change that ships to a board.
+FIRMWARE_VERSION = '1.0.0'
+MAIN_HASH = file_hash_prefix('main.py')
 
 # Load network configuration
 def read_config():
@@ -152,73 +160,96 @@ def tcp_send(sock, data):
     wdt.feed()
     send_all(sock, data)
 
-# Send hello identification message
-def send_hello_packet(sock):
-    msg = f'pico_{PICO_ID}'
-    print(f"[TCP] Sending hello: {msg}")
-    tcp_send(sock, msg.encode())
+def handle_server_event(sock, heartbeat, kind, value):
+    """Act on one event from PicoLink.receive(). Only 'data' touches the UART."""
+    if kind == 'data':
+        uart1.write(value)
+        print(f"[UART] Sent to UART: {safe_decode(value)!r}")
+        blink_led()
+    elif kind == 'pong':
+        heartbeat.pong()
+        print("[TCP] Heartbeat response: PONG")
+    elif kind == 'send':
+        tcp_send(sock, value)
+    elif kind == 'registered':
+        print(f"[TCP] Registered as '{value}' (fw {FIRMWARE_VERSION}, hash {MAIN_HASH})")
+    elif kind == 'refused':
+        raise RegistrationRefused(f'registration refused: {value}')
+    elif kind == 'error':
+        print(f"[TCP] Server reports error {value[0]}: {value[1]}")
+    elif kind == 'ignored':
+        print(f"[TCP] Ignoring opcode 0x{value:02x}, not implemented in this firmware")
+    elif kind == 'close':
+        raise OSError(value)
 
 HEARTBEAT_INTERVAL = 10   # seconds between PINGs
 HEARTBEAT_TIMEOUT = 5     # seconds to wait for one PONG (was 2, too tight for this wifi)
 HEARTBEAT_MAX_MISSES = 3  # consecutive misses before we call the connection dead
+REGISTER_TIMEOUT = 10     # seconds to wait for REGISTER_ACK before reconnecting
+REFUSED_DELAY = 30        # extra seconds to wait after the Pi refused us; it will not change its mind in 1 s
+RECV_SIZE = 256           # bytes per recv(); frames up to 1033 bytes arrive across several reads
 
 while True:
     s = create_tcp_connection()
     poller = select.poll()
     poller.register(s, select.POLLIN)
+    link = PicoLink(PICO_ID, FIRMWARE_VERSION, MAIN_HASH)
     heartbeat = HeartbeatMonitor(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
                                  HEARTBEAT_MAX_MISSES, now=time.time())
+    extra_delay = 0
 
-    # Everything from the hello onwards is inside the try: any failure closes
+    # Everything from REGISTER onwards is inside the try: any failure closes
     # the socket and reconnects, and nothing can escape the outer loop.
     try:
-        send_hello_packet(s)
+        print(f"[TCP] Sending REGISTER for {PICO_ID}")
+        tcp_send(s, link.register_frame())
+        register_deadline = time.time() + REGISTER_TIMEOUT
 
         while True:
             wdt.feed()
 
-            # UART -> server. safe_decode never raises on a malformed byte --
-            # it swaps it for U+FFFD and keeps the rest of the line -- so one
-            # noisy byte from the serial device can no longer end the loop
-            # (issue #19: "invalid UTF-8 doesn't disconnect").
-            rxed = ''
-            if uart1.any():
+            # UART -> server, as opaque DATA frames: the pty on the Pi gets
+            # exactly the bytes the device sent, terminators and all. Nothing
+            # is decoded on the way, so a malformed byte cannot raise here
+            # (issue #19: "invalid UTF-8 doesn't disconnect"); safe_decode is
+            # only used for the log line. Until REGISTER_ACK arrives the bytes
+            # wait in the UART's own buffer, because DATA before the ack is
+            # against the spec.
+            if link.registered and uart1.any():
                 try:
-                    rxed = safe_decode(uart1.read()).rstrip()
+                    raw = uart1.read()
                 except Exception as e:
                     print(f"[UART] Read error: {e}")
-            if rxed:
-                print(f"[UART] Received: '{rxed}'")
-                tcp_send(s, rxed.encode())
-                print(f"[TCP] Sent to server: '{rxed}'")
-                blink_led()
+                    raw = None
+                if raw:
+                    print(f"[UART] Received: {safe_decode(raw)!r}")
+                    for chunk in link.data_frames(raw):
+                        tcp_send(s, chunk)
+                    print(f"[TCP] Sent {len(raw)} byte(s) to server")
+                    blink_led()
 
-            # Server -> UART. poll() sleeps until the socket has something or
-            # POLL_TIMEOUT_MS passes, whichever is first. This replaces the old
-            # setblocking(False)/recv/setblocking(True)/sleep(0.05) dance.
+            # Server -> us. poll() sleeps until the socket has something or
+            # POLL_TIMEOUT_MS passes, whichever is first. The decoder inside
+            # PicoLink keeps partial frames between reads.
             for _, event in poller.poll(POLL_TIMEOUT_MS):
                 if event & (select.POLLHUP | select.POLLERR):
                     raise OSError('socket reported hangup/error')
                 if event & select.POLLIN:
-                    data = s.recv(64)
+                    data = s.recv(RECV_SIZE)
                     if not data:
                         raise OSError('server closed the connection')
-                    pongs, cmd = split_pongs(safe_decode(data))
-                    if pongs:
-                        heartbeat.pong()
-                        print("[TCP] Heartbeat response: PONG")
-                    if cmd:
-                        print(f"[TCP] Command received: '{cmd}'")
-                        uart1.write(cmd)
-                        print(f"[UART] Sent to UART: '{cmd}'")
-                        blink_led()
+                    for kind, value in link.receive(data):
+                        handle_server_event(s, heartbeat, kind, value)
+
+            now = time.time()
+            if not link.registered and now > register_deadline:
+                raise OSError(f'no REGISTER_ACK within {REGISTER_TIMEOUT} s')
 
             # Heartbeat. A lost PONG is not a lost connection: this wifi drops
             # packets, and dropping the socket on the first miss made the board
             # reconnect every ~40s all day. Only give up after several in a row.
-            now = time.time()
             if heartbeat.ping_due(now):
-                tcp_send(s, b'PING')
+                tcp_send(s, link.ping_frame())
                 heartbeat.sent(now)
                 print("[TCP] Sent heartbeat: PING")
             elif heartbeat.pong_overdue(now):
@@ -226,6 +257,10 @@ while True:
                     raise OSError(f'heartbeat lost: {heartbeat.misses} PONGs missed in a row')
                 print(f"[TCP] Heartbeat missed {heartbeat.misses}/{HEARTBEAT_MAX_MISSES}, keeping the connection")
 
+    except RegistrationRefused as e:
+        print(f"[MAIN] {e}")
+        print(f"[MAIN] Waiting {REFUSED_DELAY} s before trying again")
+        extra_delay = REFUSED_DELAY
     except Exception as e:
         print(f"[MAIN] Lost connection: {e}")
         print("[MAIN] Reconnecting...")
@@ -236,5 +271,5 @@ while True:
         except: pass
         led.off()
         print("[TCP] Socket closed.")
-        print("[MAIN] Restarting connection loop in 1 second...")
-        sleep_fed(1)
+        print(f"[MAIN] Restarting connection loop in {1 + extra_delay} second(s)...")
+        sleep_fed(1 + extra_delay)
