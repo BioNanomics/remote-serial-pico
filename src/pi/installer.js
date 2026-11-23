@@ -43,6 +43,9 @@ function renderConfig(cfg = DEFAULTS) {
         `SyslogDir: '${cfg.syslogSocket}'`,
         `CustomlogDir: '/tmp/smartHome.log'`,
         `TCP_PORT: ${cfg.tcpPort}`,
+        `# Accept boards still on the v0 (unframed) firmware. Set to false once every`,
+        `# Pico has been redeployed and the log shows no more "v0 firmware" warnings.`,
+        `AcceptLegacyPicos: true`,
         ''
     ].join('\n');
 }

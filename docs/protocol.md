@@ -182,6 +182,33 @@ TCP connect
      anything else            -> ERROR code 2, keep going
 ```
 
+## Cutover from v0
+
+v1 is deliberately incompatible with v0, and the building already runs v0
+boards. Updating `PtyServer` before every board would disconnect all of them
+at once, so the server serves both during the changeover and tells them apart
+by the **first byte** of the connection: a v1 board's first byte is always
+`MAGIC` (`0x7E`), a v0 board's is the `p` of `pico_<id>`. Nothing else is
+inspected before that decision (`src/pi/legacy.js`).
+
+A v0 connection is handled by `LegacySession`, which reproduces the old
+server's behaviour byte for byte, quirks included, and logs a warning on every
+v0 registration naming the board. A v1 connection is handled by `PicoSession`.
+Both sit behind the same pty, so Node-RED sees no difference.
+
+Rollout order:
+
+1. Deploy the new server with `AcceptLegacyPicos: true` in `config.yaml` (the
+   default when the key is missing). Every board keeps working.
+2. Redeploy boards one at a time (replug, or Phase F once it exists). Each
+   one comes back speaking v1 and its registration log line shows `fw`.
+3. When the log shows no `v0 firmware` warnings for a day, set
+   `AcceptLegacyPicos: false` and restart the service. From then on a
+   connection whose first byte is not `MAGIC` is closed at once and logged.
+
+The v0 path is a cutover aid, not a supported protocol. It will be deleted
+once step 3 has happened everywhere.
+
 ## Why framing
 
 The v0 protocol sent `pico_<id>`, `PING` and device bytes with no delimiters,
