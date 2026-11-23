@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Required checks must also run inside the merge queue, or merges wait forever.
+  merge_group:
   workflow_dispatch:
 
 permissions:
