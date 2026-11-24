@@ -1,0 +1,16 @@
+{
+    "comment": "MicroPython images `remote-serial-pico install` caches into FirmwareDir. PicoFirmwareFlasher.py picks one by BOOTSEL product id and looks it up by the key below. To move to a newer MicroPython, change url and sha256 here and re-run install; this is the only place the version is named.",
+    "version": "1.29.0",
+    "images": {
+        "RPI_PICO_W.uf2": {
+            "board": "Pico W (RP2040), BOOTSEL id 2e8a:0003",
+            "url": "https://micropython.org/resources/firmware/RPI_PICO_W-20260824-v1.29.0.uf2",
+            "sha256": "f918c0a082c6daf53e27998b7f990ba5f065db2e298b21a34024532a20786794"
+        },
+        "RPI_PICO2_W.uf2": {
+            "board": "Pico 2 W (RP2350), BOOTSEL id 2e8a:000f",
+            "url": "https://micropython.org/resources/firmware/RPI_PICO2_W-20260824-v1.29.0.uf2",
+            "sha256": "c49c7ed93eb7eeaaa78436b17bd4329e5d4ccbaebc1e79503ad75e0a29c4530e"
+        }
+    }
+}

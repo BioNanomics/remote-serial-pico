@@ -1,0 +1,7 @@
+{
+    "WIFI_SSID": "your_wifi_ssid",
+    "WIFI_PASSWORD": "your_wifi_password",
+    "IP_ADDRESS": "your_pi_ip_address",
+    "PORT": 50000,
+    "PICO_ID": "1"
+}

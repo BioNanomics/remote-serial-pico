@@ -1,0 +1,48 @@
+# remote-serial-pico configuration.
+#
+# `sudo remote-serial-pico install` copies this file to <root>/config.yaml,
+# replacing @ROOT@ with the install root (default /opt/remote-serial-pico, or
+# whatever --root was given) and @BIND@ with the network interface the Picos
+# reach this Pi on. It is written once and never overwritten, so edit the
+# installed copy freely. PtyServer, the udev-run provisioning scripts and the
+# CLI all read that one file; no path below is repeated anywhere else.
+#
+# Flat `key: value` only: the installer and the Python scripts read this file
+# without a YAML library.
+
+# --- state: owned by the service user, never regenerated, back these up -------
+# USB serial id -> friendly port name. Edit by hand to name a board.
+PicoSerialMap: '@ROOT@/data/pico_serial_map.yaml'
+# Per-device secrets (issue #19 Phase D). Mode 0600, never logged.
+PicoSecrets: '@ROOT@/data/pico_secrets.yaml'
+# What PtyServer last saw of each board (firmware version, connected or not).
+# Written by PtyServer, read by `remote-serial-pico status`.
+StateFile: '@ROOT@/data/state.json'
+# Where the serial ports appear: <symlinkDir>/<name> -> /dev/pts/N
+symlinkDir: '@ROOT@/ports'
+
+# --- root-owned: udev runs code as root against these -------------------------
+# MicroPython UF2 cache, and the auto-flash kill switch (autoflash-enabled).
+FirmwareDir: '@ROOT@/firmware'
+# Log of the provisioning scripts (flasher and deployer).
+DeployerLog: '@ROOT@/log/deployer.log'
+
+# --- logging -------------------------------------------------------------------
+SyslogDir: '/dev/log'
+CustomlogDir: '@ROOT@/data/ptyserver.log'
+
+# --- network -------------------------------------------------------------------
+# Port the Picos connect to. The deployer writes this into each board's
+# config.json, so changing it here is enough; re-plug the boards afterwards.
+TCP_PORT: 50000
+# Where PtyServer listens, and the address the deployer tells each Pico to
+# connect to. An interface name (wlan0) is resolved to that interface's IPv4
+# address each time the service starts, so a DHCP change needs no edit. An IPv4
+# address pins it. 0.0.0.0 listens on every interface, which `doctor` reports
+# as a problem: registration is not authenticated yet.
+BindAddress: '@BIND@'
+
+# --- protocol cutover ------------------------------------------------------------
+# Accept boards still on the v0 (unframed) firmware. Set to false once every
+# Pico has been redeployed and the log shows no more "v0 firmware" warnings.
+AcceptLegacyPicos: true

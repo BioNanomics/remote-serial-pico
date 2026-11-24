@@ -1,9 +1,18 @@
 #!/usr/bin/python3
 """Deploy main.py, net_util.py, frame.py and config.json to a Pico that has just appeared as a serial
-device. Run by 99-pico.rules with: DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT.
+device. Run by 99-pico.rules with:
 
-Before writing config.json it fills in the Pi's own WiFi name and password and
-its IP address, so the Pico can reach PtyServer without anyone editing a file.
+    --config <config.yaml> DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT
+
+The board's config.json is built fresh for each board: the Pi's own WiFi name
+and password, the address and port PtyServer listens on (both from
+config.yaml, so the port can never disagree with the server's), and the
+board's USB serial number. Nobody edits a file.
+
+This runs as root, so it reads only root-owned inputs and writes the
+per-board config.json, which holds the WiFi password, into a private
+temporary directory that is removed afterwards. It never writes into the
+source tree (issue #19 review, S3 and S4).
 
 The Pi may be a plain WiFi client (the original setup) or it may host its own
 access point for the Picos while it talks to the rest of the world over
@@ -14,24 +23,31 @@ Pico is the one on the WiFi interface, which is the only one a Pico can reach.
 import datetime
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
 
-PICO_MAIN_PATH = '/home/project/remote-serial-pico/src/pico/main.py'
-PICO_CONFIG_PATH = '/home/project/remote-serial-pico/src/pico/config.json'
-PICO_NET_UTIL_PATH = '/home/project/remote-serial-pico/src/pico/net_util.py'
-PICO_FRAME_PATH = '/home/project/remote-serial-pico/src/pico/frame.py'
-RSHELL = '/home/project/myenv/bin/rshell'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rsp_config  # noqa: E402
+
+# Everything below is derived, not written down a second time: the firmware
+# sits next to this script in the installed tree, and rshell sits next to the
+# interpreter the udev rule started us with (the venv's).
+PICO_SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'pico')
+PICO_FILES = ('main.py', 'net_util.py', 'frame.py')
+PICO_CONFIG_TEMPLATE = os.path.join(PICO_SRC_DIR, 'config.example.json')
+RSHELL = os.path.join(os.path.dirname(sys.executable), 'rshell')
 NM_KEYFILE_DIR = '/etc/NetworkManager/system-connections'
 HOSTAPD_CONF = '/etc/hostapd/hostapd.conf'
 WIFI_INTERFACE = 'wlan0'   # the interface the Picos are on, client or AP
-LOG_PATH = '/tmp/deployer.log'
-
-TCP_PORT = 50000
+# Replaced by DeployerLog from config.yaml in main(); this is only where
+# messages go when the script is run by hand without a config.
+LOG_PATH = os.path.join(tempfile.gettempdir(), 'deployer.log')
 
 
 def log_message(message):
@@ -190,41 +206,64 @@ def get_ip_address(run=run, interface=WIFI_INTERFACE):
     return ip_address_of(interface, run) or ip_address_with_default_route()
 
 
-def load_or_initialize_config(path=PICO_CONFIG_PATH):
-    default_config = {
-        'WIFI_SSID': 'your_wifi_ssid',
-        'WIFI_PASSWORD': 'your_wifi_password',
-        'IP_ADDRESS': 'your_ip_address',
-        'PORT': TCP_PORT,
-        'PICO_ID': '1'
-    }
-    if os.path.exists(path):
-        try:
-            with open(path) as fh:
-                return json.load(fh)
-        except json.JSONDecodeError:
-            return default_config
-    return default_config
+def _is_ipv4(text):
+    parts = str(text).split('.')
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
-def wait_for_network(run=run, timeout=30, sleep=time.sleep):
+def address_for_picos(bind, run=run):
+    """The address to hand a Pico, given BindAddress from config.yaml.
+
+    PtyServer listens on BindAddress, so the Pico must be told exactly that:
+    an IPv4 address is used as it is, an interface name is resolved to that
+    interface's address (None while it has none yet, so the caller keeps
+    waiting). With no BindAddress, or 0.0.0.0, the server listens everywhere
+    and the old discovery in get_ip_address() picks the address.
+    """
+    bind = str(bind or '').strip()
+    if not bind or bind == '0.0.0.0':
+        return get_ip_address()
+    if _is_ipv4(bind):
+        return bind
+    return ip_address_of(bind, run)
+
+
+def load_config_template(path=None):
+    """The committed placeholder config a board's config.json starts from."""
+    try:
+        with open(path or PICO_CONFIG_TEMPLATE) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {
+            'WIFI_SSID': 'your_wifi_ssid',
+            'WIFI_PASSWORD': 'your_wifi_password',
+            'IP_ADDRESS': 'your_pi_ip_address',
+            'PICO_ID': '1'
+        }
+
+
+def wait_for_network(run=run, timeout=30, sleep=time.sleep, get_ip=None):
     """At boot, udev fires for a Pico that was already plugged in before WiFi
     is up, and the deployer used to write placeholders for everything. Give the
     network a little time; give up after `timeout` seconds and warn."""
     end = time.monotonic() + timeout
     while True:
         ssid, psk, source = get_wifi_credentials(run)
-        ip_address = get_ip_address()
+        ip_address = (get_ip or get_ip_address)()
         if (ssid and psk and ip_address) or time.monotonic() >= end:
             return ssid, psk, source, ip_address
         sleep(2)
 
 
-def update_config_json(pico_serial_id, path=PICO_CONFIG_PATH, run=run, timeout=30):
-    """Fill config.json with this Pi's WiFi and IP. Values that cannot be
-    discovered are left as they were, so a hand-edited file keeps working."""
-    ssid, psk, source, ip_address = wait_for_network(run, timeout)
-    config_data = load_or_initialize_config(path)
+def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=None, template=None):
+    """Write one board's config.json to `path`: this Pi's WiFi and address, the
+    server's port and the board's serial number. Values that cannot be
+    discovered stay as the template's placeholders, and that is logged.
+
+    `path` must not exist yet and is created 0600 without following a
+    symlink: the file holds the WiFi password and this runs as root."""
+    ssid, psk, source, ip_address = wait_for_network(run, timeout, get_ip=get_ip)
+    config_data = load_config_template(template)
 
     if ssid:
         config_data['WIFI_SSID'] = ssid
@@ -232,14 +271,15 @@ def update_config_json(pico_serial_id, path=PICO_CONFIG_PATH, run=run, timeout=3
         config_data['WIFI_PASSWORD'] = psk
     if ip_address:
         config_data['IP_ADDRESS'] = ip_address
-    config_data['PORT'] = TCP_PORT
+    config_data['PORT'] = int(port)
     config_data['PICO_ID'] = str(pico_serial_id)
 
-    with open(path, 'w') as fh:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(fd, 'w') as fh:
         json.dump(config_data, fh, indent=4)
 
     log_message(f'config.json: ssid={ssid or "UNKNOWN"} psk={"set" if psk else "UNKNOWN"} '
-                f'(via {source}) ip={ip_address or "UNKNOWN"} pico_id={pico_serial_id}')
+                f'(via {source}) ip={ip_address or "UNKNOWN"} port={int(port)} pico_id={pico_serial_id}')
     if not (ssid and psk):
         log_message('WARNING: WiFi credentials not found on this Pi; the Pico will not be able to join WiFi')
     if not ip_address:
@@ -247,15 +287,15 @@ def update_config_json(pico_serial_id, path=PICO_CONFIG_PATH, run=run, timeout=3
     return bool(ssid and psk and ip_address)
 
 
-def transfer_script_to_pico(port):
+def transfer_script_to_pico(port, config_path):
     """Copy main.py, net_util.py, frame.py and config.json onto the Pico. True only if rshell succeeded.
 
     main.py imports net_util, which imports frame, so leaving either out is
     not a partial deploy -- it is a Pico that fails to boot at all.
     """
+    sources = [os.path.join(PICO_SRC_DIR, name) for name in PICO_FILES] + [config_path]
     try:
-        subprocess.check_call([RSHELL, '-p', port, 'cp',
-                               PICO_MAIN_PATH, PICO_NET_UTIL_PATH, PICO_FRAME_PATH, PICO_CONFIG_PATH, '/pyboard/'],
+        subprocess.check_call([RSHELL, '-p', port, 'cp'] + sources + ['/pyboard/'],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError) as err:
         log_message(f'Error during transfer to {port}: {err}')
@@ -286,17 +326,37 @@ def reset_pico(port):
     return True
 
 
-def main():
-    if len(sys.argv) < 5:
-        log_message(f'usage: {sys.argv[0]} DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT (got {sys.argv[1:]})')
+def main(argv=None):
+    global LOG_PATH
+    config_path, args = rsp_config.split_config_arg(list(sys.argv[1:] if argv is None else argv))
+    config = rsp_config.load(config_path)
+    if config.get('DeployerLog'):
+        LOG_PATH = config['DeployerLog']
+
+    if len(args) < 4:
+        log_message(f'usage: {sys.argv[0]} --config CONFIG DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT (got {args})')
         return 2
-    devname = sys.argv[1]
-    pico_serial_id = sys.argv[4]
+    devname = args[0]
+    pico_serial_id = args[3]
 
     log_message(f'Pico detected - Port: {devname}, ID: {pico_serial_id}')
-    update_config_json(pico_serial_id)
-    if not transfer_script_to_pico(devname):
+    port = config.get('TCP_PORT')
+    if not isinstance(port, int):
+        log_message('No TCP_PORT: pass --config <config.yaml> (the udev rule does). '
+                    'Refusing to guess a port the server may not be listening on; Pico scripts NOT deployed')
         return 1
+    bind = config.get('BindAddress')
+
+    # A directory only root can enter, so nobody can swap config.json for a
+    # symlink between writing it and rshell reading it.
+    workdir = tempfile.mkdtemp(prefix='pico-deploy-')
+    try:
+        board_config = os.path.join(workdir, 'config.json')
+        update_config_json(pico_serial_id, board_config, port, get_ip=lambda: address_for_picos(bind))
+        if not transfer_script_to_pico(devname, board_config):
+            return 1
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
     reset_pico(devname)
     return 0
 

@@ -4,9 +4,10 @@ using the firmware's own protocol code (src/pico/net_util.PicoLink and
 src/pico/frame.py run unchanged on CPython), then plays Node-RED on the pty
 side and checks bytes cross in both directions.
 
-Run inside the install-test container, as the service user:
+Run inside the install-test container, as the login user (who is in the
+service group, which is what lets them open the port):
 
-    python3 fake_pico.py --src /home/project/remote-serial-pico/src/pico
+    python3 fake_pico.py --src <root>/app/src/pico --link-dir <root>/ports --host <bind address>
 
 Exit 0 when both directions relay byte-exact, 1 on any mismatch or timeout.
 --high-bytes adds a 0x80-0xFF round trip; its result is reported but only
@@ -119,7 +120,7 @@ def main():
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=50000)
     ap.add_argument('--id', default='c1c1c1c1c1c1c1c1', help='16 hex chars')
-    ap.add_argument('--link-dir', default='/home/project')
+    ap.add_argument('--link-dir', required=True, help='symlinkDir from config.yaml')
     ap.add_argument('--timeout', type=float, default=10)
     ap.add_argument('--high-bytes', action='store_true')
     ap.add_argument('--strict-high-bytes', action='store_true')

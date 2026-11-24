@@ -8,23 +8,35 @@ is invisible to it. This script covers the step before that.
 
     blank board  --(this script)-->  MicroPython  --(PicoScriptDeployer)-->  main.py
 
-Standalone use, before udev is involved:
+The udev rule runs it as:
 
-    sudo python3 src/pi/PicoFirmwareFlasher.py /dev/sda1
+    PicoFirmwareFlasher.py --config <config.yaml> DEVNAME ID_MODEL_ID
 
-Everything is logged to /tmp/deployer.log in the same format
-PicoScriptDeployer.py uses.
+FirmwareDir (the UF2 cache and the kill switch) and DeployerLog come from that
+config.yaml, the same file the installer wrote and PtyServer reads. Standalone
+use, before udev is involved:
+
+    sudo python3 PicoFirmwareFlasher.py --config /opt/remote-serial-pico/config.yaml /dev/sda1
+
+Everything is logged to DeployerLog in the same format PicoScriptDeployer.py
+uses.
 """
 import datetime
 import errno
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
-# Defaults match the paths already hardcoded throughout this project.
-FIRMWARE_DIR = os.environ.get('PICO_FIRMWARE_DIR', '/home/project/firmware')
-LOG_PATH = os.environ.get('PICO_DEPLOYER_LOG', '/tmp/deployer.log')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rsp_config  # noqa: E402
+
+# Both are replaced in main() by FirmwareDir and DeployerLog from the
+# config.yaml the udev rule names with --config. The environment variables are
+# for running the script by hand; there is deliberately no built-in path.
+FIRMWARE_DIR = os.environ.get('PICO_FIRMWARE_DIR') or None
+LOG_PATH = os.environ.get('PICO_DEPLOYER_LOG') or os.path.join(tempfile.gettempdir(), 'deployer.log')
 
 # Kill switch: this file must exist or the script does nothing. Deliberately
 # opt-in -- this runs as root and writes to removable media.
@@ -269,11 +281,26 @@ def flash(device, product_id):
 
 
 def main():
+    global FIRMWARE_DIR, LOG_PATH
+    # Take --config out of argv so the positional arguments keep their places.
+    config_path, rest = rsp_config.split_config_arg(sys.argv[1:])
+    sys.argv[1:] = rest
+    config = rsp_config.load(config_path)
+    if config.get('DeployerLog'):
+        LOG_PATH = config['DeployerLog']
+    if config.get('FirmwareDir'):
+        FIRMWARE_DIR = config['FirmwareDir']
+
     device = resolve_device()
     if not device:
         log_message('No device given. Pass one as an argument '
-                    '(sudo python3 src/pi/PicoFirmwareFlasher.py /dev/sda1) '
+                    '(sudo python3 PicoFirmwareFlasher.py --config <config.yaml> /dev/sda1) '
                     'or set DEVNAME, as udev does.')
+        return 2
+
+    if not FIRMWARE_DIR:
+        log_message(f'No FirmwareDir, skipping {device}: pass --config <config.yaml> (the udev rule does) '
+                    'or set PICO_FIRMWARE_DIR.')
         return 2
 
     kill_switch = os.path.join(FIRMWARE_DIR, KILL_SWITCH_NAME)
