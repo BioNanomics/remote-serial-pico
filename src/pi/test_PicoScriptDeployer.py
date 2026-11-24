@@ -115,6 +115,25 @@ class TestIpAddress(unittest.TestCase):
             self.assertIsNone(D.get_ip_address(fake_run({})))
 
 
+class TestAddressForPicos(unittest.TestCase):
+    """BindAddress from config.yaml decides what a Pico is told to connect to."""
+
+    def test_an_ipv4_address_is_used_as_written(self):
+        self.assertEqual(D.address_for_picos('10.42.0.1', fake_run({})), '10.42.0.1')
+
+    def test_an_interface_name_is_resolved_and_is_none_until_it_has_an_address(self):
+        key = ('ip', '-4', '-o', 'addr', 'show', 'dev', 'eth0')
+        run = fake_run({key: '2: eth0    inet 192.168.4.7/24 brd 192.168.4.255 scope global eth0'})
+        self.assertEqual(D.address_for_picos('eth0', run), '192.168.4.7')
+        with mock.patch.object(D, 'ip_address_with_default_route', lambda: '10.9.9.9'):
+            self.assertIsNone(D.address_for_picos('eth0', fake_run({})), 'must not fall back to an address the server is not on')
+
+    def test_all_interfaces_or_missing_falls_back_to_discovery(self):
+        with mock.patch.object(D, 'get_ip_address', lambda: '10.3.18.86'):
+            self.assertEqual(D.address_for_picos('0.0.0.0'), '10.3.18.86')
+            self.assertEqual(D.address_for_picos(None), '10.3.18.86')
+
+
 class TestWaitForNetwork(unittest.TestCase):
 
     def test_returns_as_soon_as_everything_is_known(self):
@@ -175,23 +194,79 @@ class TestConfigAndTransfer(unittest.TestCase):
             ('nmcli', '-g', '802-11-wireless.ssid', 'connection', 'show', 'x'): 'mieweb-corp',
             ('nmcli', '-s', '-g', '802-11-wireless-security.psk', 'connection', 'show', 'x'): 'secret',
         })
-        self.assertTrue(D.update_config_json('e661abcd', path=self.cfg, run=run, timeout=0))
+        self.assertTrue(D.update_config_json('e661abcd', self.cfg, 50000, run=run, timeout=0))
         c = json.load(open(self.cfg))
         self.assertEqual((c['WIFI_SSID'], c['WIFI_PASSWORD'], c['IP_ADDRESS'], c['PORT'], c['PICO_ID']),
                          ('mieweb-corp', 'secret', '10.3.18.86', 50000, 'e661abcd'))
         self.assertIn('via nmcli', self._log())
+        self.assertNotIn('secret', self._log(), 'the WiFi password must never reach the log')
 
-    def test_unknown_credentials_keep_existing_values_and_warn(self):
-        with open(self.cfg, 'w') as fh:
-            json.dump({'WIFI_SSID': 'hand-edited', 'WIFI_PASSWORD': 'kept', 'IP_ADDRESS': 'x', 'PORT': 1, 'PICO_ID': '1'}, fh)
-        self.assertFalse(D.update_config_json('e661abcd', path=self.cfg, run=fake_run({}), timeout=0))
+    def test_port_comes_from_the_caller_not_a_constant(self):
+        # Issue #10: the deployer wrote 50000 whatever config.yaml said.
+        self.assertFalse(D.update_config_json('e661abcd', self.cfg, 6000, run=fake_run({}), timeout=0))
+        self.assertEqual(json.load(open(self.cfg))['PORT'], 6000)
+        self.assertFalse(hasattr(D, 'TCP_PORT'), 'no port constant may live in the deployer')
+
+    def test_config_file_is_private_and_never_follows_a_symlink(self):
+        # S3: root used to open() a path the service user could turn into a symlink.
+        target = os.path.join(self.tmp.name, 'victim')
+        with open(target, 'w') as fh:
+            fh.write('untouched')
+        os.symlink(target, self.cfg)
+        with self.assertRaises(OSError):
+            D.update_config_json('e661abcd', self.cfg, 50000, run=fake_run({}), timeout=0)
+        self.assertEqual(open(target).read(), 'untouched')
+        os.unlink(self.cfg)
+        D.update_config_json('e661abcd', self.cfg, 50000, run=fake_run({}), timeout=0)
+        self.assertEqual(os.stat(self.cfg).st_mode & 0o777, 0o600)
+
+    def test_unknown_credentials_leave_placeholders_and_warn(self):
+        self.assertFalse(D.update_config_json('e661abcd', self.cfg, 50000, run=fake_run({}), timeout=0))
         c = json.load(open(self.cfg))
-        self.assertEqual((c['WIFI_SSID'], c['WIFI_PASSWORD']), ('hand-edited', 'kept'))
+        self.assertEqual((c['WIFI_SSID'], c['WIFI_PASSWORD']), ('your_wifi_ssid', 'your_wifi_password'))
+        self.assertEqual(c['PICO_ID'], 'e661abcd')
         self.assertIn('WARNING', self._log())
+
+    def test_main_refuses_to_guess_a_port_without_config(self):
+        with mock.patch.object(D.subprocess, 'check_call') as cc:
+            self.assertEqual(D.main(['/dev/ttyACM0', '2e8a', '0005', 'e661abcd']), 1)
+        cc.assert_not_called()
+        self.assertIn('No TCP_PORT', self._log())
+
+    def test_main_reads_port_bind_and_log_from_config_and_leaves_nothing_behind(self):
+        log = os.path.join(self.tmp.name, 'from-config.log')
+        conf = os.path.join(self.tmp.name, 'config.yaml')
+        with open(conf, 'w') as fh:
+            fh.write(f"TCP_PORT: 6001\nBindAddress: '10.42.0.1'\nDeployerLog: '{log}'\n")
+        seen = {}
+
+        def fake_cp(cmd, **kw):
+            board = cmd[-2]
+            seen['cmd'] = cmd
+            seen['config'] = json.load(open(board))
+            seen['dir'] = os.path.dirname(board)
+            seen['mode'] = os.stat(seen['dir']).st_mode & 0o777
+            return 0
+        old_log = D.LOG_PATH
+        try:
+            with mock.patch.object(D.subprocess, 'check_call', fake_cp), \
+                 mock.patch.object(D, 'reset_pico', lambda port: True), \
+                 mock.patch.object(D, 'wait_for_network',
+                                   lambda run, timeout, get_ip=None: ('PicoNet', 'pw', 'hostapd', get_ip())):
+                self.assertEqual(D.main(['--config', conf, '/dev/ttyACM0', '2e8a', '0005', 'e661abcd']), 0)
+        finally:
+            D.LOG_PATH = old_log
+        self.assertEqual((seen['config']['PORT'], seen['config']['IP_ADDRESS'], seen['config']['PICO_ID']),
+                         (6001, '10.42.0.1', 'e661abcd'))
+        self.assertEqual(seen['mode'], 0o700)
+        self.assertFalse(os.path.exists(seen['dir']), 'the directory holding the WiFi password must be removed')
+        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]], ['main.py', 'net_util.py', 'frame.py', 'config.json'])
+        self.assertTrue(all(os.path.isfile(x) for x in seen['cmd'][4:-2]), 'firmware files are found next to the script')
+        self.assertIn('Pico detected', open(log).read())
 
     def test_transfer_reports_failure_honestly(self):
         with mock.patch.object(D.subprocess, 'check_call', side_effect=D.subprocess.CalledProcessError(1, 'rshell')):
-            self.assertFalse(D.transfer_script_to_pico('/dev/ttyACM0'))
+            self.assertFalse(D.transfer_script_to_pico('/dev/ttyACM0', self.cfg))
         self.assertIn('NOT deployed', self._log())
         self.assertNotIn('deployed :)', self._log())
 
@@ -212,7 +287,7 @@ class TestConfigAndTransfer(unittest.TestCase):
 
     def test_transfer_reports_success(self):
         with mock.patch.object(D.subprocess, 'check_call', return_value=0):
-            self.assertTrue(D.transfer_script_to_pico('/dev/ttyACM0'))
+            self.assertTrue(D.transfer_script_to_pico('/dev/ttyACM0', self.cfg))
         self.assertIn('deployed :)', self._log())
 
 

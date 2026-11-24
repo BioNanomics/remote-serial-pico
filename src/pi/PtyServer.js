@@ -4,6 +4,7 @@ const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
 const { sessionFor } = require('./legacy.js');
+const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup } = require('./runtime.js');
 
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
@@ -13,15 +14,17 @@ let serialIdToPicoName = {};  // Holds the mapping of serial IDs to Pico names
 let picoDevices = {};         // Tracks connected Pico devices and their sockets
 let lastPicoMappingFileTime = 0;  // Tracks last modified time of PicoSerialMap file
 
-// Load configuration from config.yaml in the current working directory
-const configFilePath = path.join(__dirname, 'config.yaml');
+// The systemd unit passes --config <install root>/config.yaml, the same file
+// the installer wrote and the provisioning scripts read. Run from a checkout
+// with no argument, it falls back to config.yaml next to this file.
+const configFilePath = configPathFrom(process.argv.slice(2));
 let config = {};
 
 try {
     const fileContents = fs.readFileSync(configFilePath, 'utf8');
     config = yaml.load(fileContents);
 } catch (err) {
-    console.error(`Failed to load config.yaml: ${err.message}`);
+    console.error(`Failed to load ${configFilePath}: ${err.message}`);
     process.exit(1);
 }
 
@@ -64,6 +67,18 @@ const logger = createLogger({
         fileTransport     // Log to a file
     ]
 });
+
+// What `remote-serial-pico status` reads: each board's firmware version and
+// whether it is connected. Without StateFile in config.yaml nothing is written.
+const state = new StateFile(config.StateFile || null);
+state.onError = (err) => logger.error(`Could not write ${config.StateFile}: ${err.message}`);
+// Keep each board's last known firmware across a restart, but nothing is
+// connected to a server that has only just started.
+const priorState = config.StateFile ? readState(config.StateFile) : null;
+if (priorState) {
+    state.picos = priorState.picos;
+    state.allDisconnected();
+}
 
 // Function to handle Pico connection
 function handlePicoConnection(serialId, socket) {
@@ -128,6 +143,11 @@ function savePicoMappingToFile() {
 // Setup pty for a given Pico
 function setupPicoPty(picoName) {
     const myPty = pty.open();
+    try {
+        sharePtyWithGroup(myPty.ptsName);
+    } catch (err) {
+        logger.warn(`Could not open ${myPty.ptsName} to the service group (${err.message}); only the service user can use this port`);
+    }
     createSymlink(picoName, myPty.ptsName);
     
     if (!picoDevices[picoName]) {
@@ -212,7 +232,7 @@ function writePicoRespToPty(picoName, payload) {
 // pty. AcceptLegacyPicos missing from config.yaml counts as true.
 const acceptLegacy = config.AcceptLegacyPicos !== false;
 
-const server = net.createServer((socket) => {
+function onPicoSocket(socket) {
     let picoName = null;
     let session = null;
     const peer = `${socket.remoteAddress}:${socket.remotePort}`;
@@ -225,6 +245,7 @@ const server = net.createServer((socket) => {
             picoName = handlePicoConnection(serialId, socket);
             picoDevices[picoName].session = session;
             picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs; fw is 'v0' for a legacy board
+            state.connected(picoName, { serial: serialId, fw: info && info.fw, hash: info && info.hash, protocol: session.protocol, peer });
             return picoName;
         },
         onData: (payload) => writePicoRespToPty(picoName, payload),
@@ -248,6 +269,7 @@ const server = net.createServer((socket) => {
             logger.warn(`${picoName} socket close event triggered; ignored this event`);
             if (picoDevices[picoName] && picoDevices[picoName].session === session) {
                 picoDevices[picoName].session = null;
+                state.disconnected(picoName);
             }
         }
     });
@@ -255,11 +277,51 @@ const server = net.createServer((socket) => {
     socket.on('error', (err) => {
         logger.error(`Socket error${picoName ? ` (${picoName})` : ''}: ${err.message}`);
     });
-});
+}
 
-server.listen(config.TCP_PORT, () => {
-    logger.info(`Server listening on TCP port ${config.TCP_PORT}`);
-});
+// Listen on BindAddress from config.yaml rather than on every interface:
+// registration is not authenticated, so the port should only be reachable from
+// the network the Picos are on. An interface name is resolved here, at start,
+// and re-checked while running, so a DHCP change moves the listener instead of
+// leaving it bound to an address the Pi no longer has.
+const BIND_RECHECK_MS = 15000;
+let server = null;
+let boundAddress = null;
+let warnedNoAddress = false;
+
+function listenOnBindAddress() {
+    const target = resolveBindAddress(config.BindAddress);
+    if (!target) {
+        if (!warnedNoAddress) {
+            logger.warn(`BindAddress ${config.BindAddress} has no IPv4 address yet; waiting for it`);
+            warnedNoAddress = true;
+        }
+        return;
+    }
+    warnedNoAddress = false;
+    if (server && target.address === boundAddress) return;
+
+    if (server) {
+        // close() only stops accepting; boards already connected keep their
+        // sockets, which is why the new address gets a server of its own.
+        logger.warn(`BindAddress moved from ${boundAddress} to ${target.address}; listening there instead`);
+        server.close();
+    }
+    const next = net.createServer(onPicoSocket);
+    next.on('error', (err) => {
+        logger.error(`Cannot listen on ${target.address}:${config.TCP_PORT}: ${err.message}`);
+        if (server === next) { server = null; boundAddress = null; }   // retried on the next check
+    });
+    next.listen(config.TCP_PORT, target.address, () => {
+        logger.info(`Server listening on ${target.address}:${config.TCP_PORT} (${target.source})`);
+        if (target.all) logger.warn('Listening on every interface; set BindAddress in config.yaml to the interface the Picos use');
+    });
+    server = next;
+    boundAddress = target.address;
+}
+
+listenOnBindAddress();
+setInterval(listenOnBindAddress, BIND_RECHECK_MS);
 
 // Cleanup function for destroying pty and socket for a given pico
 function cleanPicoResources(picoName) {
@@ -284,6 +346,7 @@ function fullCleanUp() {
     Object.keys(picoDevices).forEach((picoName) => {
         cleanPicoResources(picoName);
     });
+    state.allDisconnected();
     process.exit(0);
 }
 

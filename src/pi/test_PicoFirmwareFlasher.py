@@ -111,6 +111,35 @@ class TestInputs(FlasherTestCase):
             self.assertEqual(F.resolve_product_id('/dev/sda1', {'ID_MODEL_ID': '0003'}), '000f')
 
 
+class TestConfig(FlasherTestCase):
+
+    def test_firmware_dir_and_log_come_from_the_config_file(self):
+        other = tempfile.mkdtemp()
+        log = os.path.join(other, 'd.log')
+        conf = os.path.join(other, 'config.yaml')
+        with open(conf, 'w') as fh:
+            fh.write(f"FirmwareDir: '{other}'\nDeployerLog: '{log}'\n")
+        old = (F.FIRMWARE_DIR, F.LOG_PATH)
+        try:
+            # No kill switch in `other`, so main() must stop there, having read both keys.
+            self.assertEqual(self.run_main('--config', conf, '/dev/sda1', '0003'), 0)
+            self.assertEqual(F.FIRMWARE_DIR, other)
+            with open(log) as fh:
+                self.assertIn(os.path.join(other, F.KILL_SWITCH_NAME), fh.read())
+        finally:
+            F.FIRMWARE_DIR, F.LOG_PATH = old
+
+    def test_without_a_firmware_dir_nothing_is_touched(self):
+        with mock.patch.object(F, 'FIRMWARE_DIR', None), mock.patch.object(F, 'run') as run:
+            self.assertEqual(self.run_main('/dev/sda1', '0003'), 2)
+        run.assert_not_called()
+        self.assertIn('No FirmwareDir', self.log())
+
+    def test_no_install_path_is_built_in(self):
+        with open(F.__file__) as fh:
+            self.assertNotIn('/home/project', fh.read())
+
+
 # --- guards -----------------------------------------------------------------
 
 class TestGuards(FlasherTestCase):
