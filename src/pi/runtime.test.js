@@ -98,3 +98,62 @@ test('sharePtyWithGroup hands the port to the service group, read-write, nobody 
     R.sharePtyWithGroup('/dev/pts/3', { chownSync: (...a) => calls.push(['chown', ...a]), chmodSync: (...a) => calls.push(['chmod', ...a]) }, { uid: 999, gid: 990 });
     assert.deepStrictEqual(calls, [['chown', '/dev/pts/3', 999, 990], ['chmod', '/dev/pts/3', 0o660]]);
 });
+
+// --- Phase B: firmware identity ------------------------------------------------------
+
+test('firmwareHash covers firmware.json and every file it lists, and is null when one is missing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsp-fw-'));
+    fs.writeFileSync(path.join(dir, 'firmware.json'), '{"files": ["main.py", "lib.py"]}');
+    fs.writeFileSync(path.join(dir, 'main.py'), 'import lib\n');
+    assert.strictEqual(R.firmwareHash(dir), null);
+    fs.writeFileSync(path.join(dir, 'lib.py'), 'x = 1\n');
+    const base = R.firmwareHash(dir);
+    assert.match(base, /^[0-9a-f]{16}$/);
+    assert.deepStrictEqual(R.firmwareFiles(dir), ['firmware.json', 'main.py', 'lib.py']);
+    fs.writeFileSync(path.join(dir, 'lib.py'), 'x = 2\n');
+    assert.notStrictEqual(R.firmwareHash(dir), base, 'a change in an imported file must change the hash');
+    fs.writeFileSync(path.join(dir, 'lib.py'), 'x = 1\n');
+    assert.strictEqual(R.firmwareHash(dir), base);
+    fs.writeFileSync(path.join(dir, 'stray.py'), '# not listed\n');
+    assert.strictEqual(R.firmwareHash(dir), base, 'only listed files count');
+});
+
+// --- Phase D: the key store -----------------------------------------------------------
+
+const K1 = 'aa'.repeat(32), K2 = 'bb'.repeat(32);
+
+test('parseSecrets reads serial: key lines and ignores everything that is not exactly that', () => {
+    const m = R.parseSecrets([
+        '# remote-serial-pico device secrets',
+        `e6614103e71d2c2f: '${K1}'`,
+        `E66164084319422C: ${K2}`,
+        `1234567890123456: '${K1}'`,            // all digits: a YAML parser would make this a number
+        'e661aaaaaaaaaaaa: tooshort',
+        `not-a-serial: ${K1}`,
+        '',
+    ].join('\n'));
+    assert.deepStrictEqual([...m.keys()], ['e6614103e71d2c2f', 'e66164084319422c', '1234567890123456']);
+    assert.strictEqual(m.get('e6614103e71d2c2f').toString('hex'), K1);
+    assert.strictEqual(m.get('e66164084319422c').length, 32);
+});
+
+test('SecretStore picks up a newly provisioned or re-keyed board without a restart', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsp-keys-'));
+    const file = path.join(dir, 'pico_secrets.yaml');
+    fs.writeFileSync(file, '# empty\n');
+    const store = new R.SecretStore(file);
+    assert.strictEqual(store.get('e6614103e71d2c2f'), null);
+    fs.writeFileSync(file, `e6614103e71d2c2f: '${K1}'\n`);
+    fs.utimesSync(file, new Date(), new Date(Date.now() + 2000));
+    assert.strictEqual(store.get('E6614103E71D2C2F').toString('hex'), K1, 'lookup is case-insensitive');
+    fs.writeFileSync(file, `e6614103e71d2c2f: '${K2}'\n`);
+    fs.utimesSync(file, new Date(), new Date(Date.now() + 4000));
+    assert.strictEqual(store.get('e6614103e71d2c2f').toString('hex'), K2, 'a rotated key replaces the old one');
+});
+
+test('SecretStore with no readable file knows no board, and says why', () => {
+    const store = new R.SecretStore('/nonexistent/pico_secrets.yaml');
+    let seen = null; store.onError = (e) => { seen = e; };
+    assert.strictEqual(store.get('e6614103e71d2c2f'), null);
+    assert.ok(seen);
+});

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A Pico W that is not there: speaks wire protocol v1 to an installed PtyServer
+"""A Pico W that is not there: authenticates and speaks wire protocol v1 to an installed PtyServer
 using the firmware's own protocol code (src/pico/net_util.PicoLink and
 src/pico/frame.py run unchanged on CPython), then plays Node-RED on the pty
 side and checks bytes cross in both directions.
@@ -124,19 +124,33 @@ def main():
     ap.add_argument('--timeout', type=float, default=10)
     ap.add_argument('--high-bytes', action='store_true')
     ap.add_argument('--strict-high-bytes', action='store_true')
+    ap.add_argument('--key', default=None, help='device key, 64 hex characters; omit for a board with none')
+    ap.add_argument('--fw-hash', default=None, help='report this firmware hash instead of the real one')
+    ap.add_argument('--expect-refused', default=None, metavar='REASON',
+                    help='succeed only if the server refuses the registration with this reason')
     args = ap.parse_args()
 
     sys.path.insert(0, args.src)
-    from net_util import PicoLink
+    from net_util import PicoLink, firmware_hash
 
     sock = connect(args.host, args.port, 30)
     sock.setblocking(True)
-    link = PicoLink(args.id, 'ci-fake', 'ci-fake')
+    key = bytes.fromhex(args.key) if args.key else None
+    link = PicoLink(args.id, 'ci-fake', args.fw_hash or firmware_hash(args.src), key)
     sock.sendall(link.register_frame())
-    _, ok = pump(sock, link, lambda ev: any(k == 'registered' for k, _ in ev), args.timeout)
+    try:
+        _, ok = pump(sock, link, lambda ev: any(k == 'registered' for k, _ in ev), args.timeout)
+    except SystemExit as stop:
+        if args.expect_refused and f'refused: {args.expect_refused}' in str(stop):
+            log(f'refused as expected: {args.expect_refused}')
+            return 0
+        raise
+    if args.expect_refused:
+        log(f'FAIL: expected to be refused ({args.expect_refused}) but {"registered" if ok else "timed out"}')
+        return 1
     if not ok:
         raise SystemExit('[fake-pico] no REGISTER_ACK')
-    log(f'registered as {link.name!r}')
+    log(f'registered as {link.name!r}; the server proved it holds the device key')
 
     link_path = os.path.join(args.link_dir, link.name)
     pts = wait_for_pty(link_path, args.timeout)

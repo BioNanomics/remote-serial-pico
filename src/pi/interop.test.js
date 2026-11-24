@@ -55,3 +55,53 @@ function roundTrip(interpreter, t) {
 
 test('Pi and Pico codecs agree byte for byte (CPython)', (t) => roundTrip('python3', t));
 test('Pi and Pico codecs agree byte for byte (MicroPython)', (t) => roundTrip('micropython', t));
+
+// --- authentication and the firmware hash --------------------------------------
+// The same idea for Phase D: the board and the Pi each compute the handshake
+// proof, the session keys and every frame tag independently. If they differ
+// by one bit, no board can ever register.
+
+const crypto = require('node:crypto');
+const A = require('./auth.js');
+const { firmwareHash } = require('./runtime.js');
+
+const AUTH_HELPER = path.join(__dirname, '..', '..', 'tools', 'auth_roundtrip.py');
+const PICO_SRC = path.join(__dirname, '..', 'pico');
+const rnd = (n) => crypto.randomBytes(n);
+const AUTH_VECTORS = [
+    { key: Buffer.from(Array.from({ length: 32 }, (_, i) => i)), ns: Buffer.alloc(32, 0x53), np: Buffer.alloc(32, 0x50), id: 'e6614103e71d2c2f', counter: 0, opcode: OPCODE.REGISTER_ACK, body: Buffer.from('{"ok":true}') },
+    { key: rnd(32), ns: rnd(32), np: rnd(32), id: 'e66164084319422c', counter: 1, opcode: OPCODE.DATA, body: Buffer.from('#255.102.255.B=UP\r') },
+    { key: rnd(32), ns: rnd(32), np: rnd(32), id: '0000000000000000', counter: 255, opcode: OPCODE.PING, body: Buffer.alloc(0) },
+    { key: rnd(32), ns: rnd(32), np: rnd(32), id: 'ffffffffffffffff', counter: 256, opcode: OPCODE.DATA, body: Buffer.from(Array.from({ length: 256 }, (_, i) => i)) },
+    { key: rnd(32), ns: rnd(32), np: rnd(32), id: 'e6614103e71d2c2f', counter: 2 ** 40 + 7, opcode: OPCODE.DATA, body: Buffer.alloc(MAX_PAYLOAD - A.TAG_LEN, 0x5a) },
+];
+
+function authAgrees(interpreter, t) {
+    const input = AUTH_VECTORS.map(v =>
+        [v.key.toString('hex'), v.ns.toString('hex'), v.np.toString('hex'), v.id, v.counter, v.opcode, v.body.length ? v.body.toString('hex') : '-'].join(' ')
+    ).join('\n') + '\n';
+    let out;
+    try {
+        out = execFileSync(interpreter, [AUTH_HELPER], { input, encoding: 'utf8' });
+    } catch (err) {
+        if (err.code === 'ENOENT') { t.skip(`${interpreter} not installed`); return; }
+        throw err;
+    }
+    const lines = out.trim().split('\n');
+    assert.strictEqual(lines.length, AUTH_VECTORS.length + 1, out);
+    AUTH_VECTORS.forEach((v, i) => {
+        const keys = A.sessionKeys(v.key, v.ns, v.np, v.id);
+        const tagger = new A.Tagger(keys.picoToPi);
+        tagger.counter = BigInt(v.counter);
+        const expected = [
+            A.picoProof(v.key, v.ns, v.np, v.id), keys.picoToPi, keys.piToPico,
+            A.frameTag(keys.picoToPi, v.counter, v.opcode, v.body), tagger.seal(v.opcode, v.body),
+        ].map(b => b.toString('hex')).join(' ');
+        assert.strictEqual(lines[i], expected, `auth vector ${i} disagrees between Pi and Pico under ${interpreter}`);
+    });
+    assert.strictEqual(lines.at(-1), firmwareHash(PICO_SRC), `firmware hash disagrees between Pi and Pico under ${interpreter}`);
+    assert.match(lines.at(-1), /^[0-9a-f]{16}$/);
+}
+
+test('Pi and Pico agree on the handshake proof, session keys, frame tags and firmware hash (CPython)', (t) => authAgrees('python3', t));
+test('Pi and Pico agree on the handshake proof, session keys, frame tags and firmware hash (MicroPython)', (t) => authAgrees('micropython', t));

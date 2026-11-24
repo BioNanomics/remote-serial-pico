@@ -128,7 +128,9 @@ test('parseArgs reads the command and options, and reports what it does not unde
 test('config.yaml is generated from the committed example with the root and bind filled in', () => {
     const d = tmp(); const ctx = ctxIn(d);
     const y = I.parseFlatYaml(I.renderConfig(ctx, 'wlan0'));
-    assert.deepStrictEqual(Object.keys(y).sort(), [...I.CONFIG_KEYS, 'AcceptLegacyPicos'].sort());
+    assert.deepStrictEqual(Object.keys(y).sort(), [...I.CONFIG_KEYS, 'FirmwareMismatch'].sort());
+    assert.strictEqual(y.FirmwareMismatch, 'refuse');
+    assert.ok(!('AcceptLegacyPicos' in y), 'there is no legacy mode to configure');
     const root = ctx.cfg.root;
     assert.strictEqual(y.symlinkDir, `${root}/ports`);
     assert.strictEqual(y.PicoSerialMap, `${root}/data/pico_serial_map.yaml`);
@@ -163,7 +165,12 @@ test('udev rules are rendered from the templates: no placeholder, no fixed path'
         assert.ok(active.includes(`--config ${ctx.cfg.configPath}`), `${r.name} must pass the config file`);
         assert.ok(active.includes(`${ctx.cfg.appDir}/src/pi/`));
     }
-    assert.ok(rules[1].content.includes(`RUN+="${ctx.cfg.venvDir}/bin/python `), 'the deployer runs under the venv interpreter');
+    assert.ok(rules[1].content.includes(` ${ctx.cfg.venvDir}/bin/python ${ctx.cfg.appDir}/src/pi/PicoScriptDeployer.py `), 'the deployer runs under the venv interpreter');
+    for (const r of rules) {
+        const run = r.content.split('\n').find(l => l.startsWith('ACTION=='));
+        assert.match(run, /RUN\+="\/usr\/bin\/systemd-run --no-block --collect --unit=pico-(flash|deploy)-%k /,
+            `${r.name}: udev kills long RUN+= commands, so both rules must hand off to systemd-run`);
+    }
 });
 
 test('parseFlatYaml handles quotes, numbers and comments', () => {
@@ -780,6 +787,17 @@ test('status reports each registered Pico: connected or not, port, and firmware 
     assert.match(out, /Lights_pico +not connected +firmware v0/);
     assert.match(out, /stale port/);
     assert.match(out, /Spare_pico +not connected +firmware unknown/);
+    assert.ok(!/NOT what this Pi deploys/.test(out));
+
+    // Once the server has said which firmware it deploys, a board on another is called out.
+    fs.writeFileSync(conf.StateFile, JSON.stringify({ expectedHash: '0123456789abcdef', picos: {
+        Blinds_pico: { serial: 'e661aaaa', firmware: '1.1.0', hash: '0123456789abcdef', protocol: 'v1', connected: true },
+        Lights_pico: { serial: 'e661bbbb', firmware: '1.0.0', hash: 'ffffffffffffffff', protocol: 'v1', connected: true }
+    } }));
+    lines.length = 0;
+    I.status(sctx);
+    assert.ok(!/Blinds_pico.*NOT what this Pi deploys/.test(lines.join('\n')));
+    assert.match(lines.join('\n'), /Lights_pico .*hash ffffffffffffffff, NOT what this Pi deploys \(0123456789abcdef\): plug it in to update/);
     assert.match(out, /^autoflash off \(RPI_PICO_W\.uf2\)/m);
 });
 

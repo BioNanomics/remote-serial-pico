@@ -1,13 +1,20 @@
 #!/usr/bin/python3
-"""Deploy main.py, net_util.py, frame.py and config.json to a Pico that has just appeared as a serial
+"""Deploy the firmware (src/pico, every file firmware.json names) and config.json to a Pico that has just appeared as a serial
 device. Run by 99-pico.rules with:
 
     --config <config.yaml> DEVNAME ID_VENDOR_ID ID_MODEL_ID ID_SERIAL_SHORT
 
 The board's config.json is built fresh for each board: the Pi's own WiFi name
 and password, the address and port PtyServer listens on (both from
-config.yaml, so the port can never disagree with the server's), and the
-board's USB serial number. Nobody edits a file.
+config.yaml, so the port can never disagree with the server's), the board's
+USB serial number, and a new random 256-bit device key. Nobody edits a file.
+
+The device key is what the board later uses to prove who it is (docs/
+protocol.md, "Authentication"). USB provisioning is the only moment a secret
+can be handed over safely, so it is generated here, written to the board, and
+recorded in PicoSecrets for PtyServer. It is random, never derived from the
+serial id or the WiFi password, different for every board, and never logged.
+Plugging a board in again replaces its key, which is how a key is rotated.
 
 This runs as root, so it reads only root-owned inputs and writes the
 per-board config.json, which holds the WiFi password, into a private
@@ -21,10 +28,13 @@ knows them and from hostapd.conf if it does not, and the address handed to the
 Pico is the one on the WiFi interface, which is the only one a Pico can reach.
 """
 import datetime
+import fcntl
 import json
 import os
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,7 +49,7 @@ import rsp_config  # noqa: E402
 # sits next to this script in the installed tree, and rshell sits next to the
 # interpreter the udev rule started us with (the venv's).
 PICO_SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'pico')
-PICO_FILES = ('main.py', 'net_util.py', 'frame.py')
+PICO_MANIFEST = 'firmware.json'     # names the firmware files; the board and PtyServer read it too
 PICO_CONFIG_TEMPLATE = os.path.join(PICO_SRC_DIR, 'config.example.json')
 RSHELL = os.path.join(os.path.dirname(sys.executable), 'rshell')
 NM_KEYFILE_DIR = '/etc/NetworkManager/system-connections'
@@ -255,10 +265,78 @@ def wait_for_network(run=run, timeout=30, sleep=time.sleep, get_ip=None):
         sleep(2)
 
 
-def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=None, template=None):
+def firmware_files(src_dir=None):
+    """Every file that makes up the firmware, manifest first. One list, in
+    firmware.json, shared with the board (which hashes them) and PtyServer
+    (which compares that hash)."""
+    src_dir = src_dir or PICO_SRC_DIR
+    with open(os.path.join(src_dir, PICO_MANIFEST)) as fh:
+        return [PICO_MANIFEST] + list(json.load(fh)['files'])
+
+
+def generate_device_key():
+    """256 random bits from the kernel, as 64 hex characters."""
+    return secrets.token_hex(32)
+
+
+def record_device_key(secrets_path, pico_serial_id, key_hex):
+    """Record `serial id: key` in the PicoSecrets file, replacing any earlier
+    key for that board and keeping everyone else's.
+
+    The file lives in a directory the service user owns, and this runs as
+    root, so nothing here follows a path that user could have swapped: the
+    directory is opened once and everything else happens relative to it,
+    never through a symlink. The new file is written beside the old one,
+    mode 0600, given to the directory's owner (the service user), and renamed
+    into place, so PtyServer never reads half a file. A lock on the directory
+    keeps two boards plugged in together from losing each other's key.
+    """
+    directory, name = os.path.split(secrets_path)
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    dfd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | nofollow)
+    try:
+        fcntl.flock(dfd, fcntl.LOCK_EX)
+        owner = os.fstat(dfd)
+        lines = []
+        try:
+            fd = os.open(name, os.O_RDONLY | nofollow, dir_fd=dfd)
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd) as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    raise OSError(f'{secrets_path} is not a regular file')
+                lines = fh.read().splitlines()
+
+        wanted = pico_serial_id.lower()
+        kept = [ln for ln in lines if ln.split(':', 1)[0].strip().strip('\'"').lower() != wanted]
+        kept.append(f"{wanted}: '{key_hex}'")
+
+        tmp = f'.{name}.{os.getpid()}.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, 'w') as fh:
+                fh.write('\n'.join(kept) + '\n')
+                fh.flush()
+                os.fchmod(fh.fileno(), 0o600)
+                if os.geteuid() == 0:
+                    os.fchown(fh.fileno(), owner.st_uid, owner.st_gid)
+                os.fsync(fh.fileno())
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+
+
+def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=None, template=None, key=None):
     """Write one board's config.json to `path`: this Pi's WiFi and address, the
-    server's port and the board's serial number. Values that cannot be
-    discovered stay as the template's placeholders, and that is logged.
+    server's port, the board's serial number and its device key. Values that
+    cannot be discovered stay as the template's placeholders, and that is logged.
 
     `path` must not exist yet and is created 0600 without following a
     symlink: the file holds the WiFi password and this runs as root."""
@@ -273,13 +351,16 @@ def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=N
         config_data['IP_ADDRESS'] = ip_address
     config_data['PORT'] = int(port)
     config_data['PICO_ID'] = str(pico_serial_id)
+    if key:
+        config_data['KEY'] = key
 
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     with os.fdopen(fd, 'w') as fh:
         json.dump(config_data, fh, indent=4)
 
     log_message(f'config.json: ssid={ssid or "UNKNOWN"} psk={"set" if psk else "UNKNOWN"} '
-                f'(via {source}) ip={ip_address or "UNKNOWN"} port={int(port)} pico_id={pico_serial_id}')
+                f'(via {source}) ip={ip_address or "UNKNOWN"} port={int(port)} pico_id={pico_serial_id} '
+                f'key={"new" if key else "NONE"}')
     if not (ssid and psk):
         log_message('WARNING: WiFi credentials not found on this Pi; the Pico will not be able to join WiFi')
     if not ip_address:
@@ -288,12 +369,13 @@ def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=N
 
 
 def transfer_script_to_pico(port, config_path):
-    """Copy main.py, net_util.py, frame.py and config.json onto the Pico. True only if rshell succeeded.
+    """Copy the firmware (every file in firmware.json) and config.json onto the
+    Pico. True only if rshell succeeded.
 
-    main.py imports net_util, which imports frame, so leaving either out is
-    not a partial deploy -- it is a Pico that fails to boot at all.
+    main.py imports the others, so leaving one out is not a partial deploy --
+    it is a Pico that fails to boot at all.
     """
-    sources = [os.path.join(PICO_SRC_DIR, name) for name in PICO_FILES] + [config_path]
+    sources = [os.path.join(PICO_SRC_DIR, name) for name in firmware_files()] + [config_path]
     try:
         subprocess.check_call([RSHELL, '-p', port, 'cp'] + sources + ['/pyboard/'],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -346,15 +428,30 @@ def main(argv=None):
                     'Refusing to guess a port the server may not be listening on; Pico scripts NOT deployed')
         return 1
     bind = config.get('BindAddress')
+    secrets_path = config.get('PicoSecrets')
+    if not secrets_path:
+        log_message('No PicoSecrets in config.yaml: there is nowhere to record this board\'s device key, '
+                    'and the server refuses a board without one; Pico scripts NOT deployed')
+        return 1
 
     # A directory only root can enter, so nobody can swap config.json for a
     # symlink between writing it and rshell reading it.
     workdir = tempfile.mkdtemp(prefix='pico-deploy-')
     try:
         board_config = os.path.join(workdir, 'config.json')
-        update_config_json(pico_serial_id, board_config, port, get_ip=lambda: address_for_picos(bind))
+        key = generate_device_key()
+        update_config_json(pico_serial_id, board_config, port, get_ip=lambda: address_for_picos(bind), key=key)
         if not transfer_script_to_pico(devname, board_config):
             return 1
+        # Only now that the board holds the new key: a failed copy leaves the
+        # board and the Pi agreeing on the old one.
+        try:
+            record_device_key(secrets_path, pico_serial_id, key)
+        except OSError as err:
+            log_message(f'ERROR: the board has a new device key but it could not be recorded in {secrets_path}: {err}. '
+                        'The server will refuse this board; fix the key store and plug the board in again')
+            return 1
+        log_message(f'device key for {pico_serial_id} recorded in {secrets_path}')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     reset_pico(devname)

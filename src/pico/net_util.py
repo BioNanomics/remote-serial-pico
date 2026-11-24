@@ -2,8 +2,10 @@
 Python interpreter, with no MicroPython, no hardware, no network.
 
 MicroPython-safe: stdlib only, no f-strings in hot loops here (none needed),
-no type hints. Imports frame.py, so the deployer copies both.
+no type hints. Imports frame.py and auth.py; the deployer copies every file
+named in firmware.json.
 """
+import auth
 import frame
 
 
@@ -137,8 +139,50 @@ def file_hash_prefix(path, length=16, chunk=512):
         return 'unknown'
 
 
+FIRMWARE_MANIFEST = 'firmware.json'
+
+
+def firmware_hash(directory='', length=16, chunk=512):
+    """First `length` hex characters of SHA-256 over the whole firmware, or
+    'unknown'.
+
+    Goes into REGISTER as `hash`. It covers firmware.json and every file it
+    lists, in that order, each as: name, a zero byte, the contents, a zero
+    byte. main.py imports the others, so a hash of main.py alone could not see
+    a change in net_util.py, frame.py or auth.py. The Pi computes the same
+    value over its own copy (src/pi/runtime.js firmwareHash) and compares.
+    Read in small chunks: no file is held whole in a Pico's 264 KB of RAM.
+    """
+    try:
+        import hashlib
+        import binascii
+        import json
+        prefix = directory + '/' if directory else ''
+        with open(prefix + FIRMWARE_MANIFEST) as fh:
+            names = [FIRMWARE_MANIFEST] + list(json.load(fh)['files'])
+        h = hashlib.sha256()
+        for name in names:
+            h.update(name.encode())
+            h.update(b'\x00')
+            with open(prefix + name, 'rb') as fh:
+                while True:
+                    block = fh.read(chunk)
+                    if not block:
+                        break
+                    h.update(block)
+            h.update(b'\x00')
+        return binascii.hexlify(h.digest()).decode()[:length]
+    except Exception:
+        return 'unknown'
+
+
 class RegistrationRefused(OSError):
-    """The Pi answered REGISTER with ok=false. Retrying quickly will not help."""
+    """The Pi refused this board. Retrying quickly will not help."""
+
+
+def _random_bytes(n):
+    import os
+    return os.urandom(n)
 
 
 class PicoLink:
@@ -148,8 +192,8 @@ class PicoLink:
     (register_frame, ping_frame, data_frames) and feeds it whatever the
     socket returns; receive() answers with a list of (kind, value) events:
 
-      ('registered', name)      REGISTER_ACK ok=true; DATA may flow now
-      ('refused', reason)       REGISTER_ACK ok=false; the Pi will close
+      ('registered', name)      authenticated REGISTER_ACK ok=true; DATA may flow now
+      ('refused', reason)       the Pi will not have us; it will close
       ('data', bytes)           payload of a DATA frame, for the UART
       ('pong', None)            the server answered our PING
       ('send', bytes)           a protocol reply to put on the socket
@@ -158,17 +202,27 @@ class PicoLink:
       ('close', reason)         give up on this connection
 
     Only 'data' events ever reach the UART: that is the data path rule.
+
+    Authentication (spec, "Authentication"): the Pi answers REGISTER with a
+    nonce, we answer with our own nonce and a proof that we hold the device
+    key, and from then on every frame in both directions carries a tag. The
+    Pi's first tagged frame, REGISTER_ACK, is what proves the Pi holds the key
+    too. A frame whose tag is wrong ends the connection.
     """
 
-    def __init__(self, pico_id, fw, main_hash):
+    def __init__(self, pico_id, fw, fw_hash, key=None, rand=None):
         self.pico_id = pico_id
         self.fw = fw
-        self.main_hash = main_hash
+        self.fw_hash = fw_hash
+        self.key = key              # bytes, the per-device secret; None if never provisioned
+        self._rand = rand or _random_bytes
         self.registered = False
         self.name = None
         self.server_time = None
         self._decoder = frame.Decoder()
         self._seq = frame.Sequencer()
+        self._tx = None             # auth.Tagger, once the handshake has keys
+        self._rx = None
 
     @property
     def resyncs(self):
@@ -177,15 +231,18 @@ class PicoLink:
     # --- frames to send -----------------------------------------------------
 
     def _frame(self, opcode, payload=b''):
+        if self._tx is not None:
+            payload = self._tx.seal(opcode, payload)
         return frame.encode(opcode, self._seq.next(), payload)
 
     def _json(self, opcode, obj):
-        return frame.encode_json(opcode, self._seq.next(), obj)
+        import json
+        return self._frame(opcode, json.dumps(obj).encode())
 
     def register_frame(self):
         """The first frame on every connection."""
         return self._json(frame.OP_REGISTER,
-                          {'id': self.pico_id, 'fw': self.fw, 'hash': self.main_hash})
+                          {'id': self.pico_id, 'fw': self.fw, 'hash': self.fw_hash})
 
     def ping_frame(self):
         return self._frame(frame.OP_PING)
@@ -194,7 +251,8 @@ class PicoLink:
         return self._json(frame.OP_ERROR, {'code': code, 'msg': msg})
 
     def data_frames(self, data):
-        """UART bytes as DATA frames, split so none exceeds MAX_PAYLOAD.
+        """UART bytes as DATA frames, split so none exceeds MAX_PAYLOAD once
+        its tag is added.
 
         Empty until registered: the spec forbids DATA before REGISTER_ACK.
         main.py leaves the bytes in the UART buffer until then.
@@ -202,8 +260,9 @@ class PicoLink:
         if not self.registered or not data:
             return []
         out = []
-        for i in range(0, len(data), frame.MAX_PAYLOAD):
-            out.append(self._frame(frame.OP_DATA, data[i:i + frame.MAX_PAYLOAD]))
+        step = frame.MAX_PAYLOAD - auth.TAG_LEN
+        for i in range(0, len(data), step):
+            out.append(self._frame(frame.OP_DATA, data[i:i + step]))
         return out
 
     # --- bytes received -----------------------------------------------------
@@ -218,38 +277,84 @@ class PicoLink:
             events.append(('close', 'server sent an unsupported protocol version'))
             return events
         for f in frames:
-            self._handle(f, events)
+            if self._handle(f, events):
+                break
         return events
 
     def _handle(self, f, events):
+        """Handle one frame. True means stop: the connection is finished."""
         op = f.opcode
-        if op == frame.OP_REGISTER_ACK:
-            ack = frame.decode_json(f.payload)
-            if ack is None:
-                events.append(('send', self.error_frame(frame.ERR_BAD_PAYLOAD, 'REGISTER_ACK is not JSON')))
-            elif ack.get('ok'):
-                self.registered = True
-                self.name = ack.get('name')
-                self.server_time = ack.get('time')
-                events.append(('registered', self.name))
-            else:
-                events.append(('refused', ack.get('reason', 'no reason given')))
-        elif op == frame.OP_DATA:
-            if self.registered:
-                events.append(('data', f.payload))
-            else:
-                events.append(('send', self.error_frame(frame.ERR_NOT_REGISTERED, 'not registered yet')))
+        if not self.registered:
+            return self._handshake(op, f.payload, events)
+
+        # Registered: every frame must carry the next tag, whatever it is.
+        body = self._rx.open(op, f.payload)
+        if body is None:
+            events.append(('close', 'frame failed authentication'))
+            return True
+        if op == frame.OP_DATA:
+            events.append(('data', body))
         elif op == frame.OP_PONG:
             events.append(('pong', None))
         elif op == frame.OP_PING:
             events.append(('send', self._frame(frame.OP_PONG)))
         elif op == frame.OP_ERROR:
-            err = frame.decode_json(f.payload) or {}
+            err = frame.decode_json(body) or {}
             events.append(('error', (err.get('code'), err.get('msg'))))
         elif op in frame.KNOWN_OPCODES:
-            # Assigned to a later phase (auth, control, update): nothing to
-            # do yet, and not an error, so the server is free to probe.
+            # Assigned to a later phase (control, update), or a handshake
+            # opcode out of place: nothing to do, and not an error.
             events.append(('ignored', op))
         else:
             events.append(('send', self.error_frame(
                 frame.ERR_UNKNOWN_OPCODE, 'unknown opcode 0x%02x' % op)))
+        return False
+
+    def _handshake(self, op, payload, events):
+        if op == frame.OP_AUTH_CHALLENGE:
+            if self._tx is not None:
+                events.append(('close', 'second AUTH_CHALLENGE on one connection'))
+                return True
+            if self.key is None:
+                events.append(('refused', 'this board has no device key; plug it into the Pi to provision it'))
+                return True
+            if len(payload) != auth.NONCE_LEN:
+                events.append(('close', 'malformed AUTH_CHALLENGE'))
+                return True
+            server_nonce = bytes(payload)
+            pico_nonce = self._rand(auth.NONCE_LEN)
+            proof = auth.pico_proof(self.key, server_nonce, pico_nonce, self.pico_id)
+            # The response itself goes out untagged; everything after it is tagged.
+            events.append(('send', self._frame(frame.OP_AUTH_RESPONSE, pico_nonce + proof)))
+            to_pi, to_pico = auth.session_keys(self.key, server_nonce, pico_nonce, self.pico_id)
+            self._tx = auth.Tagger(to_pi)
+            self._rx = auth.Tagger(to_pico)
+        elif op == frame.OP_REGISTER_ACK:
+            body = self._rx.open(op, payload) if self._rx is not None else None
+            ack = frame.decode_json(body if body is not None else payload)
+            if ack is None:
+                events.append(('close', 'REGISTER_ACK is not JSON'))
+                return True
+            if not ack.get('ok'):
+                # A refusal is believed with or without a tag: all it can do
+                # is make this board wait, which anyone who can drop our
+                # packets can do anyway.
+                events.append(('refused', ack.get('reason', 'no reason given')))
+                return True
+            if body is None:
+                # ok=true without a valid tag: whoever sent it does not hold
+                # our key. Never register with it.
+                events.append(('close', 'server did not prove it holds the device key'))
+                return True
+            self.registered = True
+            self.name = ack.get('name')
+            self.server_time = ack.get('time')
+            events.append(('registered', self.name))
+        elif op == frame.OP_ERROR:
+            err = frame.decode_json(payload) or {}
+            events.append(('error', (err.get('code'), err.get('msg'))))
+        else:
+            # DATA, PING, anything else: not before the handshake is done.
+            # Dropped silently, so an impostor learns nothing from us.
+            events.append(('ignored', op))
+        return False
