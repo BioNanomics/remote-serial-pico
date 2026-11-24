@@ -3,8 +3,8 @@ const pty = require('node-pty');
 const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
-const { sessionFor } = require('./legacy.js');
-const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup } = require('./runtime.js');
+const { PicoSession } = require('./session.js');
+const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup, firmwareHash, SecretStore } = require('./runtime.js');
 
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
@@ -72,6 +72,20 @@ const logger = createLogger({
 // whether it is connected. Without StateFile in config.yaml nothing is written.
 const state = new StateFile(config.StateFile || null);
 state.onError = (err) => logger.error(`Could not write ${config.StateFile}: ${err.message}`);
+// Per-device keys, written by the deployer when a board is provisioned over
+// USB. A board is given nothing until it proves it holds its key.
+const secrets = new SecretStore(config.PicoSecrets || '');
+secrets.onError = (err) => logger.error(`Could not read the key store ${config.PicoSecrets}: ${err.message}`);
+
+// What a board running exactly the firmware this Pi deploys reports as its
+// hash. FirmwareMismatch in config.yaml: 'refuse' (the default) turns away a
+// board running anything else until it is plugged in again; 'warn' serves it
+// and logs.
+const canonicalFirmware = firmwareHash(path.join(__dirname, '..', 'pico'));
+const firmwareMismatch = config.FirmwareMismatch === 'warn' ? 'warn' : 'refuse';
+state.expectedHash = canonicalFirmware;
+logger.info(`Firmware this Pi deploys has hash ${canonicalFirmware}; a board reporting another is ${firmwareMismatch === 'warn' ? 'served with a warning' : 'refused'}`);
+
 // Keep each board's last known firmware across a restart, but nothing is
 // connected to a server that has only just started.
 const priorState = config.StateFile ? readState(config.StateFile) : null;
@@ -224,13 +238,12 @@ function writePicoRespToPty(picoName, payload) {
     }
 }
 
-// A Pico connection speaks wire protocol v1 (docs/protocol.md), or, until
-// every board in the building has been redeployed, the old unframed v0. The
-// first byte decides which session handles the socket (see legacy.js and the
-// spec's "Cutover from v0"). The session does the parsing and the protocol
-// replies; this handler only wires it to the socket, the device table and the
-// pty. AcceptLegacyPicos missing from config.yaml counts as true.
-const acceptLegacy = config.AcceptLegacyPicos !== false;
+// A Pico connection speaks wire protocol v1 (docs/protocol.md) and must
+// authenticate with its device key before anything else happens. There is no
+// unauthenticated or legacy mode. The session does the parsing and the
+// protocol replies; this handler only wires it to the socket, the device
+// table and the pty.
+const HANDSHAKE_TIMEOUT_MS = 10000;   // connect to registered, or the socket is closed
 
 function onPicoSocket(socket) {
     let picoName = null;
@@ -241,30 +254,33 @@ function onPicoSocket(socket) {
         send: (buf) => { if (!socket.destroyed) socket.write(buf); },
         close: () => socket.end(),
         log: (level, msg) => logger[level](msg),
+        secretFor: (serialId) => secrets.get(serialId),
+        // Only called once the board has authenticated, so an unknown or
+        // impersonated serial id never gets a pty or a line in the serial map.
         register: (serialId, info) => {
             picoName = handlePicoConnection(serialId, socket);
             picoDevices[picoName].session = session;
-            picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs; fw is 'v0' for a legacy board
+            picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs
             state.connected(picoName, { serial: serialId, fw: info && info.fw, hash: info && info.hash, protocol: session.protocol, peer });
             return picoName;
         },
         onData: (payload) => writePicoRespToPty(picoName, payload),
     };
 
-    socket.on('data', (data) => {
-        if (!session) {
-            session = sessionFor(data[0], hooks, { acceptLegacy });
-            if (!session) {
-                logger.warn(`${peer} does not speak wire protocol v1 and AcceptLegacyPicos is false; closing`);
-                socket.destroy();
-                return;
-            }
-            logger.info(`${peer} connected speaking protocol ${session.protocol}`);
+    session = new PicoSession(hooks, { firmwareHash: canonicalFirmware, firmwareMismatch });
+
+    // A connection that does not finish the handshake is not left open.
+    const handshakeTimer = setTimeout(() => {
+        if (!session.registered && !socket.destroyed) {
+            logger.warn(`${peer} did not authenticate within ${HANDSHAKE_TIMEOUT_MS / 1000} s; closing`);
+            socket.destroy();
         }
-        session.receive(data);
-    });
+    }, HANDSHAKE_TIMEOUT_MS);
+
+    socket.on('data', (data) => session.receive(data));
 
     socket.on('close', () => {
+        clearTimeout(handshakeTimer);
         if (picoName) {
             logger.warn(`${picoName} socket close event triggered; ignored this event`);
             if (picoDevices[picoName] && picoDevices[picoName].session === session) {

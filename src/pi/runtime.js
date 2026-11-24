@@ -4,6 +4,7 @@
 // state file `remote-serial-pico status` reads. Node built-ins only, so the
 // installer can use the same address logic before `npm install` has run.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -80,6 +81,7 @@ class StateFile {
         this.fsx = fsx;
         this.now = now;
         this.picos = {};
+        this.expectedHash = null;   // hash of the firmware this Pi deploys
         this.onError = () => {};
     }
 
@@ -106,7 +108,7 @@ class StateFile {
     // Write-then-rename, so a reader never sees half a file.
     save() {
         if (!this.file) return;
-        const body = JSON.stringify({ updatedAt: this.now().toISOString(), pid: process.pid, picos: this.picos }, null, 2) + '\n';
+        const body = JSON.stringify({ updatedAt: this.now().toISOString(), pid: process.pid, expectedHash: this.expectedHash, picos: this.picos }, null, 2) + '\n';
         const tmp = `${this.file}.tmp`;
         try {
             this.fsx.writeFileSync(tmp, body, { mode: 0o644 });
@@ -126,6 +128,67 @@ function readState(file, fsx = fs) {
     }
 }
 
+// The hash a board running exactly the firmware in `picoDir` reports in
+// REGISTER: firmware.json, then every file it lists, each as name, 0x00,
+// contents, 0x00. Must match firmware_hash() in src/pico/net_util.py.
+function firmwareHash(picoDir, fsx = fs, length = 16) {
+    try {
+        const manifest = 'firmware.json';
+        const names = [manifest, ...JSON.parse(fsx.readFileSync(path.join(picoDir, manifest), 'utf8')).files];
+        const h = crypto.createHash('sha256');
+        for (const name of names) {
+            h.update(name).update(Buffer.from([0])).update(fsx.readFileSync(path.join(picoDir, name))).update(Buffer.from([0]));
+        }
+        return h.digest('hex').slice(0, length);
+    } catch {
+        return null;
+    }
+}
+
+function firmwareFiles(picoDir, fsx = fs) {
+    return ['firmware.json', ...JSON.parse(fsx.readFileSync(path.join(picoDir, 'firmware.json'), 'utf8')).files];
+}
+
+// The key store: one `<16 hex serial id>: <64 hex key>` per line, written by
+// the deployer. Parsed by hand, not as YAML: an all-digit serial id would
+// come back from a YAML parser as a number. Lines that are not exactly a
+// serial id and a 256-bit key are ignored.
+function parseSecrets(text) {
+    const out = new Map();
+    for (const raw of String(text).split('\n')) {
+        const m = /^\s*['"]?([0-9a-fA-F]{16})['"]?\s*:\s*['"]?([0-9a-fA-F]{64})['"]?\s*$/.exec(raw);
+        if (m) out.set(m[1].toLowerCase(), Buffer.from(m[2], 'hex'));
+    }
+    return out;
+}
+
+// Reads the key store again only when it has changed, so a board that was
+// just provisioned (or re-keyed) is recognised without restarting the server.
+class SecretStore {
+    constructor(file, fsx = fs) {
+        this.file = file;
+        this.fsx = fsx;
+        this.mtime = -1;
+        this.keys = new Map();
+        this.onError = () => {};
+    }
+
+    get(serialId) {
+        try {
+            const st = this.fsx.statSync(this.file);
+            if (st.mtimeMs !== this.mtime) {
+                this.keys = parseSecrets(this.fsx.readFileSync(this.file, 'utf8'));
+                this.mtime = st.mtimeMs;
+            }
+        } catch (err) {
+            this.keys = new Map();
+            this.mtime = -1;
+            this.onError(err);
+        }
+        return this.keys.get(String(serialId).toLowerCase()) || null;
+    }
+}
+
 // A pty slave is created 0620 owner:tty, so only the service user could open
 // the port. Give it to the service's own group, read-write, so members of
 // that group (the person who ran the installer, Node-RED running as them) can
@@ -137,5 +200,5 @@ function sharePtyWithGroup(ptsName, fsx = fs, ids = { uid: process.getuid(), gid
 
 module.exports = {
     CONFIG_ENV, configPathFrom, isIPv4, ipv4Of, resolveBindAddress, networkOf, detectBindInterface,
-    StateFile, readState, clean, sharePtyWithGroup
+    StateFile, readState, clean, sharePtyWithGroup, firmwareHash, firmwareFiles, parseSecrets, SecretStore
 };

@@ -896,6 +896,7 @@ function doctorChecks(ctx) {
             sec ? `sudo chown ${c.serviceUser} ${conf.PicoSecrets} && sudo chmod 600 ${conf.PicoSecrets}` : reinstall);
 
         add('serial map', !!(conf.PicoSerialMap && stat(conf.PicoSerialMap)), conf.PicoSerialMap || 'PicoSerialMap', reinstall);
+
         add('syslog socket', !!(conf.SyslogDir && fsx.existsSync(conf.SyslogDir)), conf.SyslogDir || 'SyslogDir', 'PtyServer logs to syslog; is rsyslog/journald listening on /dev/log?');
     }
 
@@ -997,7 +998,8 @@ function status(ctx) {
             } catch {}
             const seen = state.picos[name];
             const connected = !!seen && seen.connected && live && active === 'active';
-            const fw = seen ? `firmware ${seen.firmware || '?'} (${seen.protocol || '?'}, hash ${seen.hash || '?'})` : 'firmware unknown (not seen since the server last started)';
+            const stale = seen && state.expectedHash && seen.hash !== state.expectedHash ? `, NOT what this Pi deploys (${state.expectedHash}): plug it in to update` : '';
+            const fw = seen ? `firmware ${seen.firmware || '?'} (${seen.protocol || '?'}, hash ${seen.hash || '?'}${stale})` : 'firmware unknown (not seen since the server last started)';
             ctx.log(`pico      ${name.padEnd(20)} ${connected ? 'connected    ' : 'not connected'}  ${fw}`);
             ctx.log(`          ${''.padEnd(20)} serial ${serial}, ${port}`);
         }

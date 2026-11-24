@@ -6,4 +6,12 @@
 # onto it. @VENV_PYTHON@ is the rshell venv's interpreter and @CONFIG@ is the
 # installed config.yaml; both are filled in at install time, so nothing here
 # names a path that is also written down somewhere else.
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", RUN+="@VENV_PYTHON@ @APP@/src/pi/PicoScriptDeployer.py --config @CONFIG@ '%E{DEVNAME}' '%E{ID_VENDOR_ID}' '%E{ID_MODEL_ID}' '%E{ID_SERIAL_SHORT}'"
+#
+# Started through systemd-run, not run inline, for the same reason as
+# 98-pico-bootsel.rules: udev kills a RUN+= command that outlives its event
+# timeout and holds up its event queue while it runs. The deployer waits up to
+# 30 s for the network at boot and then does an rshell transfer, which is well
+# past that. As a transient unit it has all the time it needs and shows up in
+# `journalctl -u 'pico-deploy-*'`. The udev properties are passed as arguments
+# because systemd-run does not forward udev's environment into the unit.
+ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", RUN+="/usr/bin/systemd-run --no-block --collect --unit=pico-deploy-%k @VENV_PYTHON@ @APP@/src/pi/PicoScriptDeployer.py --config @CONFIG@ %E{DEVNAME} %E{ID_VENDOR_ID} %E{ID_MODEL_ID} %E{ID_SERIAL_SHORT}"

@@ -123,7 +123,7 @@ service after editing it: `sudo systemctl restart ptyserver.service`.
 | Key | Meaning |
 | --- | --- |
 | `PicoSerialMap` | Where the serial-ID → friendly-name map is stored |
-| `PicoSecrets` | Per-device key store, mode `0600` |
+| `PicoSecrets` | Per-device key store, mode `0600`. Written by the deployer each time a board is plugged in |
 | `StateFile` | Last known firmware and connection state of each board, for `status` |
 | `symlinkDir` | Where the port symlinks are created |
 | `FirmwareDir` | MicroPython image cache and the auto-flash kill switch |
@@ -132,7 +132,7 @@ service after editing it: `sudo systemctl restart ptyserver.service`.
 | `CustomlogDir` | Plain-text application log |
 | `TCP_PORT` | Port the Picos connect to. The deployer writes it into each board's `config.json`, so change it here and re-plug the boards |
 | `BindAddress` | Where the server listens, and the address each Pico is told to connect to. An interface name (`wlan0`) is resolved each time the service starts; an IPv4 address pins it. `0.0.0.0` listens everywhere, which `doctor` reports as a problem |
-| `AcceptLegacyPicos` | Keep serving boards that still run the old unframed firmware while they are redeployed one by one. Missing counts as `true`. Set `false` when the log no longer shows "v0 firmware" warnings. See [docs/protocol.md](./docs/protocol.md), "Cutover from v0" |
+| `FirmwareMismatch` | What to do with a board whose firmware is not what this Pi would deploy: `refuse` (default) turns it away until it is plugged into the Pi again, `warn` serves it and logs. See [docs/protocol.md](./docs/protocol.md) |
 
 ### Install options
 
@@ -186,12 +186,23 @@ rule fires [PicoScriptDeployer.py](./src/pi/PicoScriptDeployer.py), which:
 1. Reads the Pi's WiFi name and password (from NetworkManager via `nmcli`, or
    from `/etc/hostapd/hostapd.conf` if the Pi hosts the Picos' access point
    itself).
-2. Builds a `config.json` for this one board from those, the address and port
+2. Generates a new random 256-bit **device key** for this board.
+3. Builds a `config.json` for this one board from those, the address and port
    the server listens on (`BindAddress` and `TCP_PORT` in `config.yaml`), and
    the board's USB serial number.
-3. Uses `rshell` to copy `config.json`, [main.py](./src/pico/main.py), `net_util.py` and `frame.py` onto the board.
+4. Uses `rshell` to copy `config.json` and the firmware (every file named in
+   [firmware.json](./src/pico/firmware.json)) onto the board.
+5. Records the key in the key store, so the server will recognise the board.
 
-The `config.json` holds your WiFi password. It is built in a private temporary
+**A board only works with the Pi it was plugged into.** When it connects over
+WiFi it has to prove it holds its key, and the Pi has to prove the same back,
+before any serial data moves; after that every message carries a tamper
+check. Knowing a board's serial number is not enough to impersonate it. A
+board that was never plugged into this Pi, that runs older firmware, or whose
+firmware differs from what this Pi deploys is refused until you plug it in
+again. Plugging a board in again also gives it a fresh key.
+
+The `config.json` holds your WiFi password and the device key. It is built in a private temporary
 directory and removed once it is on the board; it is never written into the
 installed app or this repository. [config.example.json](./src/pico/config.example.json)
 shows its shape.
@@ -211,10 +222,15 @@ If you want to load a Pico from a different machine:
 
 ```bash
 cp src/pico/config.example.json /tmp/config.json
-# edit /tmp/config.json — SSID, password, the Pi's address, and PORT to match TCP_PORT
-rshell -p /dev/ttyACM0 cp src/pico/main.py src/pico/net_util.py src/pico/frame.py /tmp/config.json /pyboard/
+# edit /tmp/config.json — SSID, password, the Pi's address, PORT to match TCP_PORT,
+# and add "KEY": "<64 hex characters>", e.g. from: openssl rand -hex 32
+rshell -p /dev/ttyACM0 cp src/pico/firmware.json src/pico/main.py src/pico/net_util.py src/pico/frame.py src/pico/auth.py /tmp/config.json /pyboard/
 rm /tmp/config.json
 ```
+
+Then put the same key on record on the Pi, or the server will refuse the
+board, as one line `<serial id>: '<key>'` in
+`/opt/remote-serial-pico/data/pico_secrets.yaml` (edit it with `sudo -u rspico`).
 
 `PICO_ID` in that file is only a label; the Pi keys off it to name the port, so
 give each board a distinct value if you set it by hand.
@@ -270,6 +286,9 @@ Start with `remote-serial-pico doctor`: it checks each of these and prints the f
 | Service is up but `status` says NOT listening | `BindAddress` names an interface with no IPv4 address yet; the server waits for it. Bring the interface up or change `BindAddress` |
 | `Permission denied` opening a port | You are not in the `rspico` group yet: log out and back in after the first install |
 | Nothing in `deployer.log` on plug-in | A board in BOOTSEL/mass-storage mode is not `2e8a:0005`; turn on auto-flash (Part 2, step 1) or flash MicroPython by hand |
+| Log says `refusing <id>: no device key on record` | The board was never plugged into this Pi (or its key was lost). Plug it in |
+| Log says `refusing <id>: it does not hold the device key` | The board's key and the Pi's differ, or something is impersonating the board. Plug the real board in to re-key it |
+| Log says `refusing <id>: it runs firmware ...` | The board's firmware is not what this Pi deploys. Plug it in, or set `FirmwareMismatch: warn` |
 | Deployer runs but Pico never connects | Wrong SSID/password captured, the Pi's address changed since the board was provisioned, or client isolation on the WiFi. Plug the board into the Pi again to re-provision it |
 | Pico LED blinks forever | Cannot join WiFi — plug it into the Pi again |
 | `cannot open .../ports/<name>` | The Pico is not currently connected, so there is no live pty behind that symlink |
@@ -295,7 +314,7 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 ## Project Details
 * **Curious about PtyServer?**
-    * Accepts a Pico's `REGISTER` frame (or, during the cutover, the old `pico_<serialId>` packet) and creates a pseudo terminal (pty) for each Pico.
+    * Challenges each Pico that sends a `REGISTER` frame to prove it holds its device key, and only then creates a pseudo terminal (pty) for it. Boards without a valid key, and the old unframed `pico_<serialId>` login, get nothing.
     * Resolves that serial ID to a friendly name via `pico_serial_map.yaml`, and symlinks the pty into `symlinkDir`.
     * Sends data available in pty to the respective Pico.
     * Writes data received from Pico into corresponding pty.
@@ -312,8 +331,8 @@ Designed to facilitate communication between a remote device (such as a Raspberr
     * It matches `2e8a:0005`, the USB serial interface a board presents once MicroPython is running. A board in BOOTSEL/mass-storage mode reports a different product ID and is handled by [98-pico-bootsel.rules.in](./src/pi/98-pico-bootsel.rules.in) instead.
 
 * **And what exactly does PicoScriptDeployer do?**
-    * It fetches `wifi-ssid, password, Pico-Serial-ID`, takes the server's address and port from `config.yaml`, and builds that board's `config.json`.
-    * Deploys [`main.py`](./src/pico/main.py), `net_util.py`, `frame.py` and that `config.json` to the most recently connected pico.
+    * It fetches `wifi-ssid, password, Pico-Serial-ID`, takes the server's address and port from `config.yaml`, generates a device key, and builds that board's `config.json`.
+    * Deploys the firmware ([`main.py`](./src/pico/main.py), `net_util.py`, `frame.py`, `auth.py`, `firmware.json`) and that `config.json` to the most recently connected pico, then records the key for the server.
     * You can observe the deployer log:
         ```
         tail -f /opt/remote-serial-pico/log/deployer.log
@@ -322,8 +341,8 @@ Designed to facilitate communication between a remote device (such as a Raspberr
 
 * **Now, what's the role of the main code in Pico?**
     * Retrieves the network credentials and server details from the `config.json`.
-    * Upon TCP connection, sends a `REGISTER` frame carrying its `Serial-ID`, its `FIRMWARE_VERSION` and a hash of its own `main.py`, and waits for the Pi's `REGISTER_ACK`. Every byte on the wire travels inside a frame; see [docs/protocol.md](./docs/protocol.md).
-    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other, unchanged, inside `DATA` frames.
+    * Upon TCP connection, sends a `REGISTER` frame carrying its `Serial-ID`, its `FIRMWARE_VERSION` and a hash of all its firmware files, answers the Pi's challenge with its device key, and accepts the Pi's `REGISTER_ACK` only if it proves the Pi holds that key too. Every byte on the wire travels inside a frame; see [docs/protocol.md](./docs/protocol.md).
+    * Continuously checks for data in TCP and Serial; if it receives data from either, it sends that data to the other, unchanged, inside `DATA` frames. Every frame after the handshake carries an authentication tag; one bad tag drops the connection.
     * Sends a heartbeat (`PING` frame) to the server every 10 seconds to ensure the connection is alive; expects a `PONG` frame back, and reconnects only after three misses in a row.
     * Reconnects automatically if the Pi closes the connection.
 

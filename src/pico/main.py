@@ -5,15 +5,17 @@ import time
 import json
 import machine
 from machine import UART, Pin, WDT
-from net_util import (safe_decode, send_all, file_hash_prefix, Backoff,
+import auth
+from net_util import (safe_decode, send_all, firmware_hash, Backoff,
                       HeartbeatMonitor, PicoLink, RegistrationRefused)
 
 # Reported to the Pi in REGISTER (docs/protocol.md), together with a hash of
-# this very file, so `remote-serial-pico status` and the logs can say which
-# firmware each board runs without anyone walking over to it. Bump on every
-# change that ships to a board.
-FIRMWARE_VERSION = '1.0.0'
-MAIN_HASH = file_hash_prefix('main.py')
+# every firmware file on this board (firmware.json lists them), so
+# `remote-serial-pico status` and the logs can say which firmware each board
+# runs without anyone walking over to it. Bump on every change that ships to
+# a board.
+FIRMWARE_VERSION = '1.1.0'
+FIRMWARE_HASH = firmware_hash()
 
 # Load network configuration
 def read_config():
@@ -26,6 +28,14 @@ WIFI_PASSWORD = config['WIFI_PASSWORD']
 IP_ADDRESS    = config['IP_ADDRESS']
 TCP_PORT      = config['PORT']
 PICO_ID       = config['PICO_ID']
+# The per-device secret the Pi wrote when this board was provisioned over USB.
+# Never printed. Without it the Pi refuses the board (docs/protocol.md,
+# "Authentication"); plugging the board into the Pi again gives it a new one.
+DEVICE_KEY    = auth.unhex(config.get('KEY') or '')
+if DEVICE_KEY is not None and len(DEVICE_KEY) != auth.KEY_LEN:
+    DEVICE_KEY = None
+if DEVICE_KEY is None:
+    print("[MAIN] No device key in config.json; the Pi will refuse this board until it is provisioned")
 
 # Initialize UART and onboard LED
 uart1 = UART(1, 19200)
@@ -172,7 +182,7 @@ def handle_server_event(sock, heartbeat, kind, value):
     elif kind == 'send':
         tcp_send(sock, value)
     elif kind == 'registered':
-        print(f"[TCP] Registered as '{value}' (fw {FIRMWARE_VERSION}, hash {MAIN_HASH})")
+        print(f"[TCP] Registered as '{value}' (fw {FIRMWARE_VERSION}, hash {FIRMWARE_HASH}); the Pi proved it holds our key")
     elif kind == 'refused':
         raise RegistrationRefused(f'registration refused: {value}')
     elif kind == 'error':
@@ -185,7 +195,7 @@ def handle_server_event(sock, heartbeat, kind, value):
 HEARTBEAT_INTERVAL = 10   # seconds between PINGs
 HEARTBEAT_TIMEOUT = 5     # seconds to wait for one PONG (was 2, too tight for this wifi)
 HEARTBEAT_MAX_MISSES = 3  # consecutive misses before we call the connection dead
-REGISTER_TIMEOUT = 10     # seconds to wait for REGISTER_ACK before reconnecting
+REGISTER_TIMEOUT = 10     # seconds for the whole handshake (challenge, response, ack) before reconnecting
 REFUSED_DELAY = 30        # extra seconds to wait after the Pi refused us; it will not change its mind in 1 s
 RECV_SIZE = 256           # bytes per recv(); frames up to 1033 bytes arrive across several reads
 
@@ -193,7 +203,7 @@ while True:
     s = create_tcp_connection()
     poller = select.poll()
     poller.register(s, select.POLLIN)
-    link = PicoLink(PICO_ID, FIRMWARE_VERSION, MAIN_HASH)
+    link = PicoLink(PICO_ID, FIRMWARE_VERSION, FIRMWARE_HASH, DEVICE_KEY)
     heartbeat = HeartbeatMonitor(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
                                  HEARTBEAT_MAX_MISSES, now=time.time())
     extra_delay = 0
@@ -231,15 +241,21 @@ while True:
             # Server -> us. poll() sleeps until the socket has something or
             # POLL_TIMEOUT_MS passes, whichever is first. The decoder inside
             # PicoLink keeps partial frames between reads.
+            #
+            # Read before looking at hangup: when the Pi refuses a board it
+            # sends the reason and closes at once, and both can show up in the
+            # same poll result. Checking hangup first threw the reason away, so
+            # the board never learned it was refused and reconnected every
+            # second instead of backing off.
             for _, event in poller.poll(POLL_TIMEOUT_MS):
-                if event & (select.POLLHUP | select.POLLERR):
-                    raise OSError('socket reported hangup/error')
                 if event & select.POLLIN:
                     data = s.recv(RECV_SIZE)
                     if not data:
                         raise OSError('server closed the connection')
                     for kind, value in link.receive(data):
                         handle_server_event(s, heartbeat, kind, value)
+                elif event & (select.POLLHUP | select.POLLERR):
+                    raise OSError('socket reported hangup/error')
 
             now = time.time()
             if not link.registered and now > register_deadline:
@@ -248,7 +264,10 @@ while True:
             # Heartbeat. A lost PONG is not a lost connection: this wifi drops
             # packets, and dropping the socket on the first miss made the board
             # reconnect every ~40s all day. Only give up after several in a row.
-            if heartbeat.ping_due(now):
+            # (Only once registered: nothing but the handshake is allowed before.)
+            if not link.registered:
+                pass
+            elif heartbeat.ping_due(now):
                 tcp_send(s, link.ping_frame())
                 heartbeat.sent(now)
                 print("[TCP] Sent heartbeat: PING")

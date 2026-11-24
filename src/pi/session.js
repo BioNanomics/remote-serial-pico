@@ -4,37 +4,66 @@
 // No I/O of its own. PtyServer.js hands it callbacks, so the whole state
 // machine is testable with a fake socket. The data-path rule from the spec is
 // enforced here: only DATA payloads are ever passed to onData (the pty).
+//
+// Nothing a board says is acted on until it has proved it holds its device
+// key (spec, "Authentication"): no pty, no entry in the serial map, no name.
+// There is no unauthenticated mode and no legacy mode.
 
+const crypto = require('crypto');
 const F = require('./frame.js');
+const A = require('./auth.js');
 
 const SERIAL_ID = /^[0-9a-f]{16}$/;
+
+// Board-supplied text goes into log lines. Keep it printable and short so a
+// board cannot forge a line of log (issue #19 review, S7).
+function printable(text, max = 64) {
+    return String(text).replace(/[^\x20-\x7e]/g, '?').slice(0, max);
+}
 
 class PicoSession {
     // hooks:
     //   send(buf)                  write bytes to the socket
     //   close()                    end the connection
     //   log(level, msg)            level is 'info' | 'warn' | 'error'
-    //   register(id, info) -> name  called once on a valid REGISTER; returns the
-    //                              board's display name. info = { fw, hash }
+    //   secretFor(id) -> Buffer    the board's 32-byte device key, or null if
+    //                              this Pi never provisioned it
+    //   register(id, info) -> name called once, after the board authenticated;
+    //                              returns its display name. info = { fw, hash }
     //   onData(buf)                a DATA payload from the board, for the pty
     //   now() -> seconds           optional, for REGISTER_ACK.time
-    constructor(hooks) {
+    //   randomBytes(n) -> Buffer   optional, for the challenge nonce
+    // options:
+    //   firmwareHash               hash of the firmware this Pi would deploy
+    //   firmwareMismatch           'refuse' (default) or 'warn': what to do
+    //                              with an authenticated board running
+    //                              something else
+    constructor(hooks, options = {}) {
         this.hooks = hooks;
+        this.firmwareHash = options.firmwareHash || null;
+        this.firmwareMismatch = options.firmwareMismatch === 'warn' ? 'warn' : 'refuse';
+        this.protocol = 'v1';
         this.decoder = new F.Decoder();
         this.seq = new F.Sequencer();
         this.name = null;          // set once registered
         this.info = null;          // { id, fw, hash }
+        this.pending = null;       // { key, nonce } between AUTH_CHALLENGE and AUTH_RESPONSE
+        this.tx = null;            // A.Tagger, pi -> pico, once authenticated
+        this.rx = null;            // A.Tagger, pico -> pi
         this.closed = false;
         this.stats = { frames: 0, dataIn: 0, dataOut: 0, pings: 0, dropped: 0 };
     }
 
     get registered() { return this.name !== null; }
+    get authenticated() { return this.rx !== null; }
 
     // --- outgoing -----------------------------------------------------------
 
-    sendFrame(opcode, payload) {
+    sendFrame(opcode, payload = Buffer.alloc(0)) {
         if (this.closed) return;
-        this.hooks.send(F.encode(opcode, this.seq.next(), payload));
+        let body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+        if (this.tx) body = this.tx.seal(opcode, body);
+        this.hooks.send(F.encode(opcode, this.seq.next(), body));
     }
 
     sendJson(opcode, obj) {
@@ -46,10 +75,13 @@ class PicoSession {
     }
 
     // Bytes from the pty, bound for the serial device. Chunked so a large
-    // paste into the pty never exceeds MAX_PAYLOAD.
+    // paste into the pty never exceeds MAX_PAYLOAD once the tag is added.
+    // Nothing is sent to a board that has not finished registering.
     sendData(buf) {
-        for (let i = 0; i < buf.length; i += F.MAX_PAYLOAD) {
-            this.sendFrame(F.OPCODE.DATA, buf.subarray(i, i + F.MAX_PAYLOAD));
+        if (!this.registered) return;
+        const step = F.MAX_PAYLOAD - A.TAG_LEN;
+        for (let i = 0; i < buf.length; i += step) {
+            this.sendFrame(F.OPCODE.DATA, buf.subarray(i, i + step));
             this.stats.dataOut += 1;
         }
     }
@@ -58,6 +90,12 @@ class PicoSession {
         if (this.closed) return;
         this.closed = true;
         this.hooks.close();
+    }
+
+    refuse(reason, logLine) {
+        this.hooks.log('warn', logLine);
+        this.sendJson(F.OPCODE.REGISTER_ACK, { ok: false, reason });
+        this.close();
     }
 
     // --- incoming -----------------------------------------------------------
@@ -86,34 +124,92 @@ class PicoSession {
     }
 
     handle(frame) {
+        if (!this.authenticated) {
+            switch (frame.opcode) {
+                case F.OPCODE.REGISTER: return this.onRegister(frame);
+                case F.OPCODE.AUTH_RESPONSE: return this.onAuthResponse(frame);
+                case F.OPCODE.ERROR: return this.onError(frame.payload);
+                default:
+                    // DATA, PING, anything: not before the board has proved who it is.
+                    this.stats.dropped += 1;
+                    this.sendError(F.ERR.NOT_REGISTERED, 'authenticate first');
+                    return;
+            }
+        }
+
+        // Authenticated: every frame must carry the next tag.
+        const body = this.rx.open(frame.opcode, frame.payload);
+        if (body === null) {
+            this.hooks.log('error', `${this.who()} sent a frame that failed authentication (altered, replayed or out of order); closing`);
+            this.close();
+            return;
+        }
         switch (frame.opcode) {
-            case F.OPCODE.REGISTER: return this.onRegister(frame);
             case F.OPCODE.PING: return this.onPing();
-            case F.OPCODE.DATA: return this.onData(frame);
-            case F.OPCODE.ERROR: return this.onError(frame);
+            case F.OPCODE.DATA: return this.onData(body);
+            case F.OPCODE.ERROR: return this.onError(body);
             case F.OPCODE.PONG: return;   // we never PING in v1, but it is legal
-            default: return this.onOther(frame);
+            default: return this.onOther(frame.opcode);
         }
     }
 
     onRegister(frame) {
-        if (this.registered) {
+        if (this.pending) {
             this.hooks.log('warn', `${this.who()} sent a second REGISTER; ignored`);
             return;
         }
         const reg = F.decodeJson(frame.payload);
         const id = reg && typeof reg.id === 'string' ? reg.id.toLowerCase() : null;
         if (!id || !SERIAL_ID.test(id)) {
-            this.hooks.log('warn', `refusing malformed registration: ${JSON.stringify(frame.payload.toString('utf8').slice(0, 80))}`);
-            this.sendJson(F.OPCODE.REGISTER_ACK, { ok: false, reason: 'malformed registration' });
-            this.close();
+            return this.refuse('malformed registration',
+                `refusing malformed registration: ${JSON.stringify(printable(frame.payload.toString('latin1'), 80))}`);
+        }
+        const fw = typeof reg.fw === 'string' ? printable(reg.fw) : 'unknown';
+        const hash = typeof reg.hash === 'string' ? printable(reg.hash) : 'unknown';
+        this.info = { id, fw, hash };
+
+        const key = this.hooks.secretFor(id);
+        if (!key) {
+            return this.refuse('unknown device',
+                `refusing ${id}: no device key on record. Plug the board into this Pi to provision it`);
+        }
+        const nonce = (this.hooks.randomBytes || crypto.randomBytes)(A.NONCE_LEN);
+        this.pending = { key, nonce };
+        this.sendFrame(F.OPCODE.AUTH_CHALLENGE, nonce);
+    }
+
+    onAuthResponse(frame) {
+        if (!this.pending) {
+            this.stats.dropped += 1;
+            this.sendError(F.ERR.NOT_REGISTERED, 'register first');
             return;
         }
-        const fw = typeof reg.fw === 'string' ? reg.fw : 'unknown';
-        const hash = typeof reg.hash === 'string' ? reg.hash : 'unknown';
-        this.info = { id, fw, hash };
+        const { key, nonce } = this.pending;
+        const { id, fw, hash } = this.info;
+        const ok = frame.payload.length === A.NONCE_LEN + 32 &&
+            A.equal(A.picoProof(key, nonce, frame.payload.subarray(0, A.NONCE_LEN), id), frame.payload.subarray(A.NONCE_LEN));
+        if (!ok) {
+            return this.refuse('authentication failed',
+                `refusing ${id}: it does not hold the device key on record (wrong key, or something impersonating the board)`);
+        }
+        const keys = A.sessionKeys(key, nonce, frame.payload.subarray(0, A.NONCE_LEN), id);
+        this.pending.key = null;
+        // From here every frame both ways is tagged, starting with our reply:
+        // a correctly tagged REGISTER_ACK is what proves to the board that
+        // this server holds its key too.
+        this.tx = new A.Tagger(keys.piToPico);
+        this.rx = new A.Tagger(keys.picoToPi);
+
+        if (this.firmwareHash && hash !== this.firmwareHash) {
+            if (this.firmwareMismatch === 'refuse') {
+                return this.refuse('firmware mismatch',
+                    `refusing ${id}: it runs firmware ${fw} (hash ${hash}) but this Pi deploys hash ${this.firmwareHash}. Plug the board into this Pi to update it`);
+            }
+            this.hooks.log('warn', `${id} runs firmware ${fw} (hash ${hash}), not the hash ${this.firmwareHash} this Pi deploys`);
+        }
+
         this.name = this.hooks.register(id, { fw, hash });
-        this.hooks.log('info', `${this.name} registered: serial ${id}, firmware ${fw}, hash ${hash}`);
+        this.hooks.log('info', `${this.name} registered: serial ${id}, firmware ${fw}, hash ${hash}, authenticated`);
         this.sendJson(F.OPCODE.REGISTER_ACK, {
             ok: true,
             name: this.name,
@@ -126,40 +222,34 @@ class PicoSession {
         this.sendFrame(F.OPCODE.PONG);
     }
 
-    onData(frame) {
+    onData(body) {
         if (!this.registered) {
             this.stats.dropped += 1;
-            this.sendError(F.ERR.NOT_REGISTERED, 'register first');
             return;
         }
         this.stats.dataIn += 1;
-        this.hooks.onData(frame.payload);
+        this.hooks.onData(body);
     }
 
-    onError(frame) {
-        const err = F.decodeJson(frame.payload) || {};
-        this.hooks.log('warn', `${this.who()} reports error ${err.code}: ${err.msg}`);
+    onError(body) {
+        const err = F.decodeJson(body) || {};
+        this.hooks.log('warn', `${this.who()} reports error ${printable(err.code, 8)}: ${printable(err.msg, 120)}`);
     }
 
-    onOther(frame) {
-        const name = F.OPCODE_NAME[frame.opcode];
-        if (!this.registered) {
-            this.stats.dropped += 1;
-            this.sendError(F.ERR.NOT_REGISTERED, 'register first');
-            return;
-        }
+    onOther(opcode) {
+        const name = F.OPCODE_NAME[opcode];
         if (name) {
-            // Assigned to a later phase; nothing to do with it yet.
-            this.hooks.log('warn', `${this.who()} sent ${name}, which this server does not implement yet; ignored`);
+            // Assigned to a later phase, or a handshake opcode out of place.
+            this.hooks.log('warn', `${this.who()} sent ${name}, which this server does not act on here; ignored`);
         } else {
-            this.hooks.log('warn', `${this.who()} sent unknown opcode 0x${frame.opcode.toString(16)}; ignored`);
-            this.sendError(F.ERR.UNKNOWN_OPCODE, `unknown opcode 0x${frame.opcode.toString(16)}`);
+            this.hooks.log('warn', `${this.who()} sent unknown opcode 0x${opcode.toString(16)}; ignored`);
+            this.sendError(F.ERR.UNKNOWN_OPCODE, `unknown opcode 0x${opcode.toString(16)}`);
         }
     }
 
     who() {
-        return this.name || (this.info && this.info.id) || 'unregistered pico';
+        return this.name || (this.info && this.info.id) || 'unauthenticated peer';
     }
 }
 
-module.exports = { PicoSession, SERIAL_ID };
+module.exports = { PicoSession, SERIAL_ID, printable };

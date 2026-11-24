@@ -8,7 +8,16 @@ layout below is frozen. Only payload contents of not-yet-implemented opcodes
 may still be filled in.
 
 Every byte between a Pico and `PtyServer` travels inside a frame. There is no
-unframed mode: the first byte a Pico ever sends is `0x7E`.
+unframed mode: the first byte a Pico ever sends is `0x7E`. There is no
+unauthenticated mode either: a board gets nothing until it has proved it holds
+its device key, and from then on every frame carries an authentication tag
+(see "Authentication").
+
+**Status.** The frame layout has not changed since it was first written down.
+Authentication was specified (this revision) before any board was flashed with
+v1, in response to the review on issue #19 (finding S6), so `VER` is still 1.
+Nothing here has run on a physical board yet; until it has, treat "frozen" as
+"frozen pending the bench test".
 
 This replaces the v0 protocol (bare `pico_<id>` / `PING` / raw device bytes),
 which had no delimiters and therefore could not tell device data apart from
@@ -55,8 +64,8 @@ opaque.
 | `0x04` | `PONG` | either | empty | B |
 | `0x05` | `ERROR` | either | JSON `{"code": int, "msg": str}` | B |
 | `0x10` | `DATA` | either | bytes: raw UART traffic | B |
-| `0x20` | `AUTH_CHALLENGE` | Pi → Pico | bytes: 32-byte nonce | D |
-| `0x21` | `AUTH_RESPONSE` | Pico → Pi | bytes: 32-byte HMAC-SHA256 | D |
+| `0x20` | `AUTH_CHALLENGE` | Pi → Pico | bytes: 32-byte server nonce | D |
+| `0x21` | `AUTH_RESPONSE` | Pico → Pi | bytes: 32-byte Pico nonce + 32-byte HMAC-SHA256 proof | D |
 | `0x30` | `CONTROL_REQUEST` | Pi → Pico | JSON `{"cmd": str, "args": {...}}` | E |
 | `0x31` | `CONTROL_RESPONSE` | Pico → Pi | JSON `{"ok": bool, "result": {...}}` | E |
 | `0x40` | `UPDATE_OFFER` | Pi → Pico | JSON `{"len": int, "sha256": hex}` | F |
@@ -66,6 +75,10 @@ opaque.
 
 Codes not in this table are invalid. A receiver that sees one replies `ERROR`
 code 2 and ignores the frame.
+
+The payloads in this table are what a frame carries *before* its
+authentication tag. Once the handshake is done, 16 more bytes follow every
+payload (see "Authentication"), and `LEN` counts them.
 
 `DATA` payloads are **opaque**. The framing layer never inspects them, so a
 payload may legally contain `0x7E`, the bytes `PING`, or any other sequence.
@@ -93,11 +106,29 @@ Sent by the Pico as the first frame on every TCP connection. Payload:
   as the old `pico_<id>` registration, so `PicoSerialMap` needs no migration.
 * `fw` the firmware's own version string, from `FIRMWARE_VERSION` in
   `main.py`. Human readable, for logs and `remote-serial-pico status`.
-* `hash` the first 16 hex characters of SHA-256 over the deployed `main.py`.
-  What Phase F compares against the canonical file in git.
+* `hash` the first 16 hex characters of SHA-256 over the **whole deployed
+  firmware**: `firmware.json`, then each file it lists, in order, each
+  contributing its name, a zero byte, its contents and a zero byte. `main.py`
+  imports the other files, so a hash of `main.py` alone could not see a change
+  in them. The Pi computes the same value over its own copy of `src/pico`.
 
-`PtyServer` logs all three on every registration. That satisfies the issue's
+`REGISTER` is a claim, not proof: the Pi does nothing with it except look up
+the device key for `id` and send a challenge. No pty is allocated and nothing
+is written to `PicoSerialMap` until the board has authenticated.
+
+Once it has, `PtyServer` logs all three values. That satisfies the issue's
 robustness acceptance criterion "every board reports a firmware version".
+
+**Firmware mismatch.** If `hash` is not the hash of the firmware this Pi would
+deploy, the board is refused (`REGISTER_ACK` with `ok` false, reason
+`firmware mismatch`) and stays refused until it is plugged into the Pi again,
+which redeploys it. `FirmwareMismatch: warn` in `config.yaml` serves it and
+logs a warning instead. The check happens after authentication, so only a
+genuine board can be told anything about firmware. Phase F will replace the
+refusal with an update.
+
+A protocol version mismatch is always refused: see "Version mismatch" under
+"Framing rules".
 
 ### REGISTER_ACK
 
@@ -108,14 +139,113 @@ The Pi's reply, sent before any `DATA`. Payload:
 ```
 
 * `ok` false means the registration was refused. `name` is then absent and
-  `reason` holds a short string. The Pi closes the connection afterwards.
+  `reason` holds a short string: `malformed registration`, `unknown device`
+  (no key on record for that id), `authentication failed`, or
+  `firmware mismatch`. The Pi closes the connection afterwards, and the Pico
+  waits 30 s before trying again.
 * `name` the human name from `PicoSerialMap`, or the serial id if unmapped.
 * `time` Pi's Unix time in seconds, so a Pico with no RTC can timestamp logs.
 
 Until the Pico has received `REGISTER_ACK` with `ok` true it MUST NOT send
-`DATA`, and the Pi discards any `DATA` that arrives before it. Phase D inserts
-`AUTH_CHALLENGE`/`AUTH_RESPONSE` between `REGISTER` and `REGISTER_ACK`; the
-Pico must therefore be prepared to answer a challenge while waiting for the ack.
+`DATA` or `PING`, and the Pi answers anything but the handshake opcodes with
+`ERROR` code 4. `AUTH_CHALLENGE` and `AUTH_RESPONSE` always come between
+`REGISTER` and a successful `REGISTER_ACK`.
+
+A `REGISTER_ACK` with `ok` true is only valid with a correct authentication
+tag. A Pico that receives one without it MUST close the connection and MUST
+NOT treat itself as registered.
+
+## Authentication
+
+Every board has its own 256-bit **device key**. `PicoScriptDeployer.py`
+generates it from the kernel's random source when the board is plugged into
+the Pi's USB port, writes it into the board's `config.json` as `KEY`, and
+records it in `PicoSecrets` (mode `0600`, owned by the service user). USB
+provisioning is the trusted path and the only moment a secret can be handed
+over safely. The key is never derived from the serial id (which is in USB
+descriptors, logs and symlink names) or from the WiFi password, it is
+different for every board so one opened board is not the building, and it is
+never logged. Plugging a board in again replaces its key, which is how a key
+is rotated.
+
+The key is plaintext on the board's filesystem. Anyone who can plug the board
+into a computer and open a REPL can read it. Physical access is out of scope;
+the aim is that a network attacker cannot impersonate a board or the Pi, and
+that one stolen board exposes one key.
+
+### Handshake
+
+```
+Pico                                             Pi
+  REGISTER {id, fw, hash}             ----->
+                                      <-----     AUTH_CHALLENGE  Ns (32 random bytes)
+  AUTH_RESPONSE  Np || proof          ----->
+                                                 verifies proof; derives session keys
+                                      <-----     REGISTER_ACK {ok, name, time} + tag
+  verifies the tag; registered
+  every later frame, both ways, carries a tag
+```
+
+With `K` the device key, `id` the 16-character serial id as ASCII, `Ns` the
+Pi's nonce, `Np` the Pico's nonce (32 random bytes, fresh for every
+connection), and `HMAC` meaning HMAC-SHA256:
+
+```
+proof      = HMAC(K, "rsp1 pico proof"    || 0x00 || Ns || Np || id)
+K_pico->pi = HMAC(K, "rsp1 key pico->pi"  || 0x00 || Ns || Np || id)
+K_pi->pico = HMAC(K, "rsp1 key pi->pico"  || 0x00 || Ns || Np || id)
+```
+
+* The Pi compares `proof` in constant time. A wrong proof, a response of the
+  wrong length, or an id with no key on record is refused and logged. `Ns` is
+  fresh, so a recorded `AUTH_RESPONSE` is useless on any later connection.
+* The handshake is **mutual**. The Pi never sends a proof of its own; instead
+  its `REGISTER_ACK` is the first frame tagged with `K_pi->pico`, which only
+  a holder of `K` can compute for this `Np`. A server that does not hold the
+  key cannot produce an ack the Pico will accept, so it cannot register a
+  board, send it `DATA`, or (Phase F) offer it firmware.
+* The two session keys exist for one connection only and differ per
+  direction, so a frame cannot be reflected back at its sender or replayed
+  into a later connection.
+* The Pi closes a connection that has not completed the handshake within
+  10 s.
+
+`REGISTER`, `AUTH_CHALLENGE`, `AUTH_RESPONSE`, a refusing `REGISTER_ACK` sent
+before the Pi has verified the proof, and any `ERROR` sent before the
+handshake completes are the only frames ever sent without a tag.
+
+### Frame tags
+
+After the handshake every frame's payload is followed by a 16-byte tag, and
+`LEN` covers both:
+
+```
+tag = first 16 bytes of HMAC(K_direction, counter || OPCODE || payload)
+```
+
+`counter` is a 64-bit big-endian integer, one per direction, starting at 0
+with the first tagged frame of the connection (the Pi's `REGISTER_ACK`, the
+Pico's first frame after `AUTH_RESPONSE`) and incremented by one per tagged
+frame. It is **never transmitted**: both ends count. TCP delivers in order, so
+a receiver accepts exactly the next counter value and nothing else.
+
+A receiver that gets a frame whose tag does not verify (altered, injected,
+replayed, dropped or reordered, or too short to hold a tag) MUST discard it
+without acting on it and close the connection. It does not send an `ERROR`.
+The Pico then reconnects and authenticates again from scratch.
+
+Because of the tag, the largest `DATA` payload a sender produces is
+`MAX_PAYLOAD - 16` = 1008 bytes; longer data is split across frames.
+
+CRC-16 detects line noise. It was never meant to stop tampering, and anyone
+who alters a frame can recompute it. The tag is what makes a frame trustworthy.
+
+This covers every opcode, including the ones not implemented yet:
+`CONTROL_REQUEST` (Phase E) and `UPDATE_OFFER` / `UPDATE_CHUNK` (Phase F) are
+only acted on if their tag verifies, so a control command or a firmware image
+is accepted only from the holder of this board's key. That is what meets the
+issue's "authentication before OTA" rule. Encryption (Phase G) is a separate
+matter: tags give integrity and authenticity, not confidentiality.
 
 ### PING / PONG
 
@@ -141,10 +271,11 @@ the sender of an `ERROR` decides for itself whether to close the connection.
 ## Sequence numbers
 
 The sender increments `SEQ` on every frame it sends, wrapping at `0xFFFF`.
-In v1 a receiver MUST accept any `SEQ` value and MAY log a gap. Phase D adds
-replay rejection and Phase F uses `SEQ` to order `UPDATE_CHUNK`s; both rely on
-the counter having been there from the first frame, which is why it is not
-optional now.
+A receiver MUST accept any `SEQ` value and MAY log a gap. `SEQ` is 16 bits
+and travels in the clear, so it is a diagnostic and, in Phase F, an ordering
+aid for `UPDATE_CHUNK`s. It is **not** what rejects replays: that is the
+64-bit counter inside the frame tag, which does not wrap within the life of a
+connection and cannot be chosen by a sender who does not hold the key.
 
 ## Framing rules
 
@@ -171,9 +302,10 @@ with `ERROR` code 1. The responder then closes.
 ```
 TCP connect
   -> send REGISTER
-  <- (Phase D: AUTH_CHALLENGE, answer with AUTH_RESPONSE)
-  <- REGISTER_ACK ok=true          otherwise: log reason, close, back off
-  loop:
+  <- AUTH_CHALLENGE                answer with AUTH_RESPONSE, derive session keys
+  <- REGISTER_ACK ok=true + tag    refused, or ok=true without a valid tag:
+                                   log reason, close, back off
+  loop (every frame tagged; a bad tag closes the connection):
      UART bytes available     -> send DATA
      DATA received            -> write payload to UART
      every 10 s               -> send PING, expect PONG
@@ -182,32 +314,21 @@ TCP connect
      anything else            -> ERROR code 2, keep going
 ```
 
-## Cutover from v0
+## No legacy mode
 
-v1 is deliberately incompatible with v0, and the building already runs v0
-boards. Updating `PtyServer` before every board would disconnect all of them
-at once, so the server serves both during the changeover and tells them apart
-by the **first byte** of the connection: a v1 board's first byte is always
-`MAGIC` (`0x7E`), a v0 board's is the `p` of `pico_<id>`. Nothing else is
-inspected before that decision (`src/pi/legacy.js`).
+The v0 protocol (bare `pico_<id>`) is not accepted. A connection that does
+not open with a v1 `REGISTER` and complete the handshake gets no pty, no entry
+in `PicoSerialMap` and no reply, and is closed after 10 s. An earlier revision
+of the server carried a `LegacySession` and an `AcceptLegacyPicos` switch to
+serve v0 boards during a changeover; it was removed because any
+unauthenticated path defeats authentication for every board, and the issue
+this work belongs to says so in as many words ("there is no legacy mode to
+support; do not build one").
 
-A v0 connection is handled by `LegacySession`, which reproduces the old
-server's behaviour byte for byte, quirks included, and logs a warning on every
-v0 registration naming the board. A v1 connection is handled by `PicoSession`.
-Both sit behind the same pty, so Node-RED sees no difference.
-
-Rollout order:
-
-1. Deploy the new server with `AcceptLegacyPicos: true` in `config.yaml` (the
-   default when the key is missing). Every board keeps working.
-2. Redeploy boards one at a time (replug, or Phase F once it exists). Each
-   one comes back speaking v1 and its registration log line shows `fw`.
-3. When the log shows no `v0 firmware` warnings for a day, set
-   `AcceptLegacyPicos: false` and restart the service. From then on a
-   connection whose first byte is not `MAGIC` is closed at once and logged.
-
-The v0 path is a cutover aid, not a supported protocol. It will be deleted
-once step 3 has happened everywhere.
+The consequence for an existing installation: installing this server stops
+serving boards that run older firmware, and boards that have no device key.
+Each one comes back when it is plugged into the Pi's USB port once, which
+deploys the current firmware and gives it a key.
 
 ## Why framing
 
@@ -231,12 +352,16 @@ frame.
 | --- | --- | --- |
 | Pico codec | `src/pico/frame.py` | `src/pico/test_frame.py` |
 | Pi codec | `src/pi/frame.js` | `src/pi/frame.test.js` |
-| Cross-check | both | `src/pi/interop.test.js` encodes in JS, decodes in Python |
+| Pico authentication | `src/pico/auth.py` | `src/pico/test_auth.py` |
+| Pi authentication | `src/pi/auth.js` | `src/pi/session.test.js` |
+| Cross-check | both | `src/pi/interop.test.js`: frames encoded in JS and decoded in Python; proof, session keys, frame tags and firmware hash computed on both sides and compared, under CPython and MicroPython |
+| Key provisioning | `src/pi/PicoScriptDeployer.py` | `src/pi/test_PicoScriptDeployer.py` |
+| Key store, firmware hash | `src/pi/runtime.js` | `src/pi/runtime.test.js` |
 | Server | `src/pi/PtyServer.js` | `src/pi/session.test.js` (the protocol logic lives in `session.js`) |
 | Firmware protocol logic | `src/pico/net_util.py` (`PicoLink`) | `src/pico/test_net_util.py` |
 | Firmware | `src/pico/main.py` | `src/pi/firmware.sim.test.js` runs the real `main.py` on a desktop, via `tools/pico_sim/`, against a `PicoSession` |
 
 The desktop simulation swaps in stand-ins for MicroPython's `machine` and
-`network` modules only; sockets, `select.poll`, framing, registration, relay
-and reconnect all run unmodified. What it cannot prove is MicroPython's own
+`network` modules only; sockets, `select.poll`, framing, authentication,
+registration, relay and reconnect all run unmodified. What it cannot prove is MicroPython's own
 socket and poll behaviour on a Pico W: that needs a board.

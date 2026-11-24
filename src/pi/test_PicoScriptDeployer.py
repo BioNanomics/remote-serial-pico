@@ -237,7 +237,8 @@ class TestConfigAndTransfer(unittest.TestCase):
         log = os.path.join(self.tmp.name, 'from-config.log')
         conf = os.path.join(self.tmp.name, 'config.yaml')
         with open(conf, 'w') as fh:
-            fh.write(f"TCP_PORT: 6001\nBindAddress: '10.42.0.1'\nDeployerLog: '{log}'\n")
+            fh.write(f"TCP_PORT: 6001\nBindAddress: '10.42.0.1'\nDeployerLog: '{log}'\n"
+                     f"PicoSecrets: '{os.path.join(self.tmp.name, 'pico_secrets.yaml')}'\n")
         seen = {}
 
         def fake_cp(cmd, **kw):
@@ -260,9 +261,83 @@ class TestConfigAndTransfer(unittest.TestCase):
                          (6001, '10.42.0.1', 'e661abcd'))
         self.assertEqual(seen['mode'], 0o700)
         self.assertFalse(os.path.exists(seen['dir']), 'the directory holding the WiFi password must be removed')
-        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]], ['main.py', 'net_util.py', 'frame.py', 'config.json'])
+        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]],
+                         ['firmware.json', 'main.py', 'net_util.py', 'frame.py', 'auth.py', 'config.json'])
         self.assertTrue(all(os.path.isfile(x) for x in seen['cmd'][4:-2]), 'firmware files are found next to the script')
-        self.assertIn('Pico detected', open(log).read())
+        logged = open(log).read()
+        self.assertIn('Pico detected', logged)
+
+        # Phase D: the board got a fresh 256-bit key, the same key is on
+        # record for the server, and it appears in no log.
+        key = seen['config']['KEY']
+        self.assertRegex(key, r'^[0-9a-f]{64}$')
+        secrets_file = os.path.join(self.tmp.name, 'pico_secrets.yaml')
+        self.assertEqual(open(secrets_file).read(), f"e661abcd: '{key}'\n")
+        self.assertEqual(os.stat(secrets_file).st_mode & 0o777, 0o600)
+        self.assertNotIn(key, logged)
+        self.assertIn('device key for e661abcd recorded', logged)
+
+    def _provision(self, conf, serial='e661abcd', cp=None):
+        seen = {}
+
+        def fake_cp(cmd, **kw):
+            seen['config'] = json.load(open(cmd[-2]))
+            return 0
+        old_log = D.LOG_PATH
+        try:
+            with mock.patch.object(D.subprocess, 'check_call', cp or fake_cp), \
+                 mock.patch.object(D, 'reset_pico', lambda port: True), \
+                 mock.patch.object(D, 'wait_for_network',
+                                   lambda run, timeout, get_ip=None: ('PicoNet', 'pw', 'hostapd', '10.42.0.1')):
+                code = D.main(['--config', conf, '/dev/ttyACM0', '2e8a', '0005', serial])
+        finally:
+            D.LOG_PATH = old_log
+        return code, seen.get('config')
+
+    def _conf(self):
+        conf = os.path.join(self.tmp.name, 'config.yaml')
+        self.secrets = os.path.join(self.tmp.name, 'pico_secrets.yaml')
+        with open(conf, 'w') as fh:
+            fh.write(f"TCP_PORT: 6001\nBindAddress: '10.42.0.1'\nDeployerLog: '{self.log}'\nPicoSecrets: '{self.secrets}'\n")
+        return conf
+
+    def test_every_board_gets_its_own_key_and_replugging_rotates_it(self):
+        conf = self._conf()
+        _, a1 = self._provision(conf, 'e661aaaa')
+        _, b1 = self._provision(conf, 'e661bbbb')
+        self.assertNotEqual(a1['KEY'], b1['KEY'], 'per-device, not fleet-wide')
+        _, a2 = self._provision(conf, 'e661aaaa')
+        self.assertNotEqual(a1['KEY'], a2['KEY'], 'plugging a board in again replaces its key')
+        self.assertEqual(open(self.secrets).read(), f"e661bbbb: '{b1['KEY']}'\ne661aaaa: '{a2['KEY']}'\n")
+
+    def test_the_key_is_random_not_derived_from_the_serial_id_or_the_wifi_password(self):
+        keys = {D.generate_device_key() for _ in range(50)}
+        self.assertEqual(len(keys), 50)
+        for k in keys:
+            self.assertEqual(len(bytes.fromhex(k)), 32)
+        conf = self._conf()
+        _, board = self._provision(conf, 'e661aaaa')
+        self.assertNotIn('e661aaaa', board['KEY'])
+        self.assertNotEqual(board['KEY'], board['WIFI_PASSWORD'])
+
+    def test_a_failed_copy_leaves_the_recorded_key_alone(self):
+        conf = self._conf()
+        _, first = self._provision(conf, 'e661aaaa')
+        failing = mock.Mock(side_effect=D.subprocess.CalledProcessError(1, 'rshell'))
+        code, _ = self._provision(conf, 'e661aaaa', cp=failing)
+        self.assertEqual(code, 1)
+        self.assertEqual(open(self.secrets).read(), f"e661aaaa: '{first['KEY']}'\n",
+                         'the board still holds the old key, so the Pi must too')
+
+    def test_without_a_key_store_nothing_is_deployed(self):
+        conf = os.path.join(self.tmp.name, 'config.yaml')
+        with open(conf, 'w') as fh:
+            fh.write(f"TCP_PORT: 6001\nDeployerLog: '{self.log}'\n")
+        with mock.patch.object(D.subprocess, 'check_call') as cc:
+            self.assertEqual(D.main(['--config', conf, '/dev/ttyACM0', '2e8a', '0005', 'e661abcd']), 1)
+        cc.assert_not_called()
+        self.assertIn('No PicoSecrets', self._log())
+
 
     def test_transfer_reports_failure_honestly(self):
         with mock.patch.object(D.subprocess, 'check_call', side_effect=D.subprocess.CalledProcessError(1, 'rshell')):
@@ -289,6 +364,46 @@ class TestConfigAndTransfer(unittest.TestCase):
         with mock.patch.object(D.subprocess, 'check_call', return_value=0):
             self.assertTrue(D.transfer_script_to_pico('/dev/ttyACM0', self.cfg))
         self.assertIn('deployed :)', self._log())
+
+
+class TestRecordDeviceKey(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'pico_secrets.yaml')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_keeps_comments_and_other_boards_and_is_always_0600(self):
+        with open(self.path, 'w') as fh:
+            fh.write("# header\nE661AAAA: 'old'\ne661bbbb: 'bbbb'\n")
+        os.chmod(self.path, 0o644)
+        D.record_device_key(self.path, 'e661aaaa', 'new')
+        self.assertEqual(open(self.path).read(), "# header\ne661bbbb: 'bbbb'\ne661aaaa: 'new'\n")
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.listdir(self.tmp.name), ['pico_secrets.yaml'], 'no temp file left behind')
+
+    def test_creates_the_file_if_it_is_missing(self):
+        D.record_device_key(self.path, 'e661aaaa', 'k')
+        self.assertEqual(open(self.path).read(), "e661aaaa: 'k'\n")
+
+    def test_never_reads_or_writes_through_a_symlink(self):
+        # Root runs this in a directory the service user owns. A symlink there
+        # must not make root read or overwrite another file.
+        victim = os.path.join(self.tmp.name, 'victim')
+        with open(victim, 'w') as fh:
+            fh.write('root:secret-hash\n')
+        os.symlink(victim, self.path)
+        with self.assertRaises(OSError):
+            D.record_device_key(self.path, 'e661aaaa', 'k')
+        self.assertEqual(open(victim).read(), 'root:secret-hash\n')
+        self.assertTrue(os.path.islink(self.path))
+
+    def test_firmware_files_come_from_the_manifest(self):
+        self.assertEqual(D.firmware_files(), ['firmware.json', 'main.py', 'net_util.py', 'frame.py', 'auth.py'])
+        for name in D.firmware_files():
+            self.assertTrue(os.path.isfile(os.path.join(D.PICO_SRC_DIR, name)), name)
 
 
 if __name__ == '__main__':

@@ -162,9 +162,18 @@ check_running() {   # check_running "label"
     expect_ok "$1: doctor all green" test $code -eq 0
 }
 
+fake_pico() {   # fake_pico <args...>: the simulated board, as the login user
+    as_pi python3 /srv/ci/fake_pico.py --src "$RSP_ROOT/app/src/pico" --link-dir "$RSP_ROOT/ports" \
+        --host "$BIND_IP" --port "$PORT" "$@"
+}
+
+# What the deployer does when a board is plugged in: record its key. Appending
+# as root keeps the file's owner and mode.
+PICO_KEY=$(openssl rand -hex 32)
+in_root sh -c "printf \"%s: '%s'\\n\" '$PICO_ID' '$PICO_KEY' >> '$RSP_ROOT/data/pico_secrets.yaml'"
+
 relay() {   # relay "label"
-    out=$(as_pi python3 /srv/ci/fake_pico.py --src "$RSP_ROOT/app/src/pico" --link-dir "$RSP_ROOT/ports" \
-            --host "$BIND_IP" --port "$PORT" --id "$PICO_ID" --high-bytes 2>&1); code=$?
+    out=$(fake_pico --id "$PICO_ID" --key "$PICO_KEY" --high-bytes 2>&1); code=$?
     echo "$out"
     expect_ok "$1: simulated Pico registers and relays byte-exact both ways" test $code -eq 0
     if grep -q HIGH_BYTES_FAILED <<<"$out"; then
@@ -209,6 +218,8 @@ done
 expect_ok "auto-flash stays off until someone turns it on" in_root test ! -e "$RSP_ROOT/firmware/autoflash-enabled"
 
 rules=$(in_root cat /etc/udev/rules.d/98-pico-bootsel.rules /etc/udev/rules.d/99-pico.rules | grep -v '^#')
+expect_ok "neither udev rule runs its script inline (both hand off to systemd-run)" \
+    sh -c 'test "$(echo "$1" | grep -c "RUN+=\"/usr/bin/systemd-run --no-block --collect --unit=pico-")" -eq 2' sh "$rules"
 expect_ok "udev rules point at the install root and pass the config" \
     sh -c 'echo "$1" | grep -q -- "--config $2/config.yaml" && ! echo "$1" | grep -q "@"' sh "$rules" "$RSP_ROOT"
 
@@ -218,6 +229,47 @@ out=$(as_pi remote-serial-pico status 2>&1)
 echo "$out"
 expect_ok "status lists the Pico" grep -q "$PICO_ID" <<<"$out"
 expect_ok "status shows the Pico's firmware version" grep -Eq "$PICO_ID +(connected|not connected) +firmware ci-fake" <<<"$out"
+
+# ---------------------------------------------------------------------------
+step "authentication (Phase D): only a board holding its key gets a port"
+refused() {   # refused "label" "reason" fake_pico args...
+    local what=$1 reason=$2; shift 2
+    out=$(fake_pico --expect-refused "$reason" "$@" 2>&1); code=$?
+    echo "$out"
+    expect_ok "$what" test $code -eq 0
+}
+STRANGER=dddddddddddddddd
+refused "a serial id this Pi never provisioned is refused" "unknown device" --id "$STRANGER" --key "$(openssl rand -hex 32)"
+refused "the right serial id with the wrong key is refused" "authentication failed" --id "$PICO_ID" --key "$(openssl rand -hex 32)"
+refused "the right serial id with no key at all is refused" "this board has no device key" --id "$PICO_ID"
+refused "an authenticated board on other firmware is refused" "firmware mismatch" --id "$PICO_ID" --key "$PICO_KEY" --fw-hash 0000000000000000
+expect_ok "a refused serial id got no port and no line in the serial map" \
+    sh -c "! docker exec '$NAME' test -e '$RSP_ROOT/ports/$STRANGER' && ! docker exec '$NAME' grep -q '$STRANGER' '$RSP_ROOT/data/pico_serial_map.yaml'"
+
+# The old v0 registration (unframed "pico_<id>") must get nothing: no port, no reply.
+out=$(as_pi python3 -c "
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+s.sendall(b'pico_eeeeeeeeeeeeeeee')
+s.settimeout(15)
+try:
+    data = s.recv(100)
+except socket.timeout:
+    print('STILL-OPEN'); sys.exit(1)
+print('reply', data)
+sys.exit(0 if data == b'' else 1)
+" "$BIND_IP" "$PORT" 2>&1); code=$?
+echo "$out"
+expect_ok "a v0 (unframed) registration gets no reply and is disconnected: no legacy mode" test $code -eq 0
+expect_ok "the v0 serial id got no port" sh -c "! docker exec '$NAME' test -e '$RSP_ROOT/ports/eeeeeeeeeeeeeeee'"
+expect_ok "refusals are logged" in_root grep -q "refusing $PICO_ID: it does not hold the device key" "$RSP_ROOT/data/ptyserver.log"
+if in_root grep -rqs -- "$PICO_KEY" "$RSP_ROOT/data/ptyserver.log" "$RSP_ROOT/log" /var/log 2>/dev/null \
+   || in_root journalctl --no-pager 2>/dev/null | grep -q -- "$PICO_KEY"; then
+    fail "a device key appears in a log"
+else
+    pass "no device key appears in any log"
+fi
+relay "after the refused attempts"
 
 # ---------------------------------------------------------------------------
 step "the provisioning scripts take everything from config.yaml"
@@ -234,6 +286,7 @@ import PicoScriptDeployer as D
 seen = {}
 def fake_cp(cmd, **kw):
     seen['rshell'] = cmd[0]
+    seen['cmd'] = cmd
     seen['config'] = json.load(open(cmd[-2]))
     return 0
 D.subprocess.check_call = fake_cp
@@ -242,6 +295,7 @@ D.get_wifi_credentials = lambda run=None, *a, **k: ('PicoNet', password, 'hostap
 code = D.main(['--config', f'{root}/config.yaml', '/dev/ttyACM0', '2e8a', '0005', 'e661abcd00000000'])
 board = seen.get('config') or {}
 print('exit', code, 'rshell', seen.get('rshell'), 'password-delivered', board.pop('WIFI_PASSWORD', None) == password, 'board', json.dumps(board))
+print('files', ' '.join(p.rsplit('/', 1)[1] for p in seen.get('cmd', [])[4:-1]))
 PY
 docker cp "$WORK/deployer_standin.py" "$NAME:/srv/ci/deployer_standin.py"
 out=$(in_root "$RSP_ROOT/venv/bin/python" /srv/ci/deployer_standin.py "$RSP_ROOT" "$WIFI_PW" 2>&1)
@@ -254,6 +308,24 @@ expect_ok "deployer puts the WiFi password on the board" grep -q 'password-deliv
 leak=$(in_root grep -rl -- "$WIFI_PW" "$RSP_ROOT" /tmp /run /var/tmp 2>/dev/null)
 if [ -z "$leak" ]; then pass "the WiFi password is left nowhere on disk"; else fail "WiFi password left in: $leak"; fi
 expect_ok "deployer logged to the root-owned log" in_root grep -q 'pico_id=e661abcd00000000' "$RSP_ROOT/log/deployer.log"
+expect_ok "deployer copies every firmware file the manifest names" grep -q '^files firmware.json main.py net_util.py frame.py auth.py config.json$' <<<"$out"
+
+# Phase D: the deployer gave that board a key and recorded it for the server.
+BOARD_KEY=$(sed -n 's/.*"KEY": "\([0-9a-f]\{64\}\)".*/\1/p' <<<"$out")
+expect_ok "deployer generated a 256-bit device key for the board" test ${#BOARD_KEY} -eq 64
+expect_ok "the same key is on record in the key store" in_root grep -q "^e661abcd00000000: '$BOARD_KEY'\$" "$RSP_ROOT/data/pico_secrets.yaml"
+expect_ok "the key store is still 0600 and the service user's after the deployer wrote it as root" \
+    test "$(in_root stat -c '%a %U' "$RSP_ROOT/data/pico_secrets.yaml")" = "600 $SVC_USER"
+expect_ok "the key store kept the other board's key" in_root grep -q "^$PICO_ID: '$PICO_KEY'\$" "$RSP_ROOT/data/pico_secrets.yaml"
+if in_root grep -q -- "$BOARD_KEY" "$RSP_ROOT/log/deployer.log"; then fail "the device key is in the deployer log"; else pass "the device key is not in the deployer log"; fi
+# The whole chain: a board carrying exactly what the deployer wrote can register.
+out=$(fake_pico --id e661abcd00000000 --key "$BOARD_KEY" 2>&1); code=$?
+echo "$out"
+expect_ok "a board provisioned by the deployer authenticates and relays, with no server restart" test $code -eq 0
+out=$(in_root "$RSP_ROOT/venv/bin/python" /srv/ci/deployer_standin.py "$RSP_ROOT" "$WIFI_PW" 2>&1)
+NEW_KEY=$(sed -n 's/.*"KEY": "\([0-9a-f]\{64\}\)".*/\1/p' <<<"$out")
+expect_ok "plugging the board in again rotates its key" test -n "$NEW_KEY" -a "$NEW_KEY" != "$BOARD_KEY"
+refused "after rotation the old key no longer works" "authentication failed" --id e661abcd00000000 --key "$BOARD_KEY"
 
 out=$(in_root python3 "$RSP_ROOT/app/src/pi/PicoFirmwareFlasher.py" --config "$RSP_ROOT/config.yaml" /dev/null 0003 2>&1)
 echo "$out"

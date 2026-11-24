@@ -13,7 +13,8 @@
 # --- state: owned by the service user, never regenerated, back these up -------
 # USB serial id -> friendly port name. Edit by hand to name a board.
 PicoSerialMap: '@ROOT@/data/pico_serial_map.yaml'
-# Per-device secrets (issue #19 Phase D). Mode 0600, never logged.
+# Per-device keys, one `<serial id>: '<key>'` per line, written by the deployer
+# each time a board is plugged in. Mode 0600, never logged.
 PicoSecrets: '@ROOT@/data/pico_secrets.yaml'
 # What PtyServer last saw of each board (firmware version, connected or not).
 # Written by PtyServer, read by `remote-serial-pico status`.
@@ -42,7 +43,11 @@ TCP_PORT: 50000
 # as a problem: registration is not authenticated yet.
 BindAddress: '@BIND@'
 
-# --- protocol cutover ------------------------------------------------------------
-# Accept boards still on the v0 (unframed) firmware. Set to false once every
-# Pico has been redeployed and the log shows no more "v0 firmware" warnings.
-AcceptLegacyPicos: true
+# --- boards ---------------------------------------------------------------------
+# Every board must prove it holds its device key (PicoSecrets) before it is
+# served; there is no setting that turns that off. This one decides what
+# happens to an authenticated board whose firmware is not what this Pi would
+# deploy (see `remote-serial-pico status`):
+#   refuse   turn it away until it is plugged into this Pi again (the default)
+#   warn     serve it and log a warning
+FirmwareMismatch: refuse
