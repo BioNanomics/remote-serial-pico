@@ -157,3 +157,21 @@ test('SecretStore with no readable file knows no board, and says why', () => {
     assert.strictEqual(store.get('e6614103e71d2c2f'), null);
     assert.ok(seen);
 });
+
+// --- Phase F: what an update sends --------------------------------------------------
+
+test('firmwareBundle carries every hashed file with its sha256, and never boot.py', () => {
+    const real = path.join(__dirname, '..', 'pico');
+    const bundle = R.firmwareBundle(real);
+    assert.strictEqual(bundle.hash, R.firmwareHash(real), 'the board will report exactly this after installing it');
+    assert.strictEqual(bundle.files[0].name, 'firmware.json');
+    const manifest = JSON.parse(fs.readFileSync(path.join(real, 'firmware.json'), 'utf8'));
+    assert.deepStrictEqual(bundle.files.map(f => f.name), ['firmware.json', ...manifest.files]);
+    assert.deepStrictEqual(manifest.usb_only, ['boot.py']);
+    assert.ok(!bundle.files.some(f => f.name === 'boot.py' || f.name === 'config.json'), 'the recovery path and the secrets are never sent');
+    for (const f of bundle.files) {
+        assert.strictEqual(f.sha256, require('node:crypto').createHash('sha256').update(f.data).digest('hex'));
+        assert.ok(f.data.length > 0 && f.data.length < 128 * 1024, `${f.name} fits the board's per-file limit`);
+    }
+    assert.strictEqual(R.firmwareBundle(path.join(os.tmpdir(), 'no-such-firmware')), null);
+});

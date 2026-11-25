@@ -265,13 +265,29 @@ def wait_for_network(run=run, timeout=30, sleep=time.sleep, get_ip=None):
         sleep(2)
 
 
+def _manifest(src_dir=None):
+    with open(os.path.join(src_dir or PICO_SRC_DIR, PICO_MANIFEST)) as fh:
+        return json.load(fh)
+
+
 def firmware_files(src_dir=None):
     """Every file that makes up the firmware, manifest first. One list, in
     firmware.json, shared with the board (which hashes them) and PtyServer
-    (which compares that hash)."""
-    src_dir = src_dir or PICO_SRC_DIR
-    with open(os.path.join(src_dir, PICO_MANIFEST)) as fh:
-        return [PICO_MANIFEST] + list(json.load(fh)['files'])
+    (which compares that hash, and sends these files as an update)."""
+    return [PICO_MANIFEST] + list(_manifest(src_dir)['files'])
+
+
+def usb_only_files(src_dir=None):
+    """Files only this script ever puts on a board: boot.py, the recovery
+    path for firmware updates, which is never replaced over the air."""
+    return list(_manifest(src_dir).get('usb_only', []))
+
+
+# Copied onto the board with the firmware. It overwrites whatever an earlier
+# over-the-air update left in update.json, so boot.py does not "restore" files
+# older than the ones just deployed.
+UPDATE_MARKER = 'update.json'
+EMPTY_UPDATE_MARKER = {'files': [], 'boots': 0}
 
 
 def generate_device_key():
@@ -368,14 +384,15 @@ def update_config_json(pico_serial_id, path, port, run=run, timeout=30, get_ip=N
     return bool(ssid and psk and ip_address)
 
 
-def transfer_script_to_pico(port, config_path):
+def transfer_script_to_pico(port, config_path, extra=()):
     """Copy the firmware (every file in firmware.json) and config.json onto the
     Pico. True only if rshell succeeded.
 
     main.py imports the others, so leaving one out is not a partial deploy --
     it is a Pico that fails to boot at all.
     """
-    sources = [os.path.join(PICO_SRC_DIR, name) for name in firmware_files()] + [config_path]
+    sources = [os.path.join(PICO_SRC_DIR, name) for name in firmware_files() + usb_only_files()]
+    sources += list(extra) + [config_path]
     try:
         subprocess.check_call([RSHELL, '-p', port, 'cp'] + sources + ['/pyboard/'],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -441,7 +458,10 @@ def main(argv=None):
         board_config = os.path.join(workdir, 'config.json')
         key = generate_device_key()
         update_config_json(pico_serial_id, board_config, port, get_ip=lambda: address_for_picos(bind), key=key)
-        if not transfer_script_to_pico(devname, board_config):
+        marker = os.path.join(workdir, UPDATE_MARKER)
+        with open(marker, 'w') as fh:
+            json.dump(EMPTY_UPDATE_MARKER, fh)
+        if not transfer_script_to_pico(devname, board_config, extra=[marker]):
             return 1
         # Only now that the board holds the new key: a failed copy leaves the
         # board and the Pi agreeing on the old one.

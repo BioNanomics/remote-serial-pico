@@ -336,6 +336,58 @@ echo "$out"
 expect_ok "someone outside the service group cannot use ctl" test $code -ne 0
 
 # ---------------------------------------------------------------------------
+step "firmware update over the air (Phase F): an older board is brought up to date"
+# "Older firmware": this firmware with one line added to main.py, so its hash differs.
+in_root sh -c "rm -rf /srv/ci/old-firmware && cp -r '$RSP_ROOT/app/src/pico' /srv/ci/old-firmware \
+    && echo '# an older build' >> /srv/ci/old-firmware/main.py && chmod -R a+rX /srv/ci/old-firmware"
+OTA_ID=0707070707070707
+OTA_KEY=$(openssl rand -hex 32)
+in_root sh -c "printf \"%s: '%s'\\n\" '$OTA_ID' '$OTA_KEY' >> '$RSP_ROOT/data/pico_secrets.yaml'"
+start_old_board() {   # --reboot: power it back on after a reset, files intact, like hardware
+    in_root sh -c ': > /tmp/ota.log; chmod 666 /tmp/ota.log'
+    docker exec -d -u pi "$NAME" sh -c "tail -f /dev/null | python3 -u '$RSP_ROOT/app/tools/pico_sim/run_main.py' --reboot \
+        --src /srv/ci/old-firmware --host '$BIND_IP' --port '$PORT' --id '$OTA_ID' --key '$OTA_KEY' >> /tmp/ota.log 2>&1"
+}
+stop_boards() { in_root sh -c "pkill -f pico_sim/run_main.py; pkill -f 'tail -f /dev/null'; true"; }
+wait_ota() {   # wait_ota "regex in the board's own output" [seconds]
+    for _ in $(seq 1 $(( ${2:-20} * 4 ))); do in_root grep -Eq "$1" /tmp/ota.log 2>/dev/null && return 0; sleep 0.25; done
+    in_root tail -n 25 /tmp/ota.log; return 1
+}
+srv_log() { in_root grep -E "$1" "$RSP_ROOT/data/ptyserver.log"; }
+
+expect_ok "updates are off unless asked for" test "$(cfg FirmwareUpdate)" = false
+start_old_board
+expect_ok "with updates off, a board on other firmware is refused and nothing is sent to it" \
+    wait_ota "registration refused: firmware mismatch"
+expect_ok "no update was offered" sh -c "! docker exec '$NAME' grep -q '\[OTA\]' /tmp/ota.log"
+stop_boards
+
+in_root sed -i "s/^FirmwareUpdate: .*/FirmwareUpdate: true/" "$RSP_ROOT/config.yaml"
+in_root systemctl restart ptyserver.service
+for _ in $(seq 1 20); do in_root ss -H -tln | grep -q " $BIND_IP:$PORT " && break; sleep 0.5; done
+start_old_board
+expect_ok "with updates on, the board receives and verifies the new firmware" wait_ota "\[OTA\] Update verified" 40
+expect_ok "it restarts with the new firmware on trial under boot.py" wait_ota "\[BOOT\] New firmware on trial, start 1 of 3" 20
+expect_ok "it registers on the new firmware" wait_ota "Registered as '$OTA_ID'" 30
+expect_ok "and confirms it, ending the trial" wait_ota "\[OTA\] New firmware confirmed" 10
+NEW_HASH=$(in_root "$RSP_ROOT/venv/bin/python" -c "import sys; sys.path.insert(0, '$RSP_ROOT/app/src/pico'); import net_util; print(net_util.firmware_hash('$RSP_ROOT/app/src/pico'))")
+OLD_HASH=$(in_root "$RSP_ROOT/venv/bin/python" -c "import sys; sys.path.insert(0, '$RSP_ROOT/app/src/pico'); import net_util; print(net_util.firmware_hash('/srv/ci/old-firmware'))")
+echo "old firmware $OLD_HASH, new firmware $NEW_HASH"
+srv_log "firmware update" | tail -n 6
+expect_ok "the server logged the old and the new version" \
+    sh -c "docker exec '$NAME' grep -q 'firmware update complete: $OTA_ID was hash $OLD_HASH, now runs .* (hash $NEW_HASH)' '$RSP_ROOT/data/ptyserver.log'"
+out=$(as_pi remote-serial-pico status 2>&1)
+expect_ok "status shows the board on the firmware this Pi deploys" \
+    sh -c 'echo "$1" | grep -E "$2 +connected" | grep -q "hash $3)"' sh "$out" "$OTA_ID" "$NEW_HASH"
+out=$(ctl "$OTA_ID" update 2>&1); code=$?
+echo "$out"
+expect_ok "ctl update: a board that is already current is left alone" sh -c 'test "$1" -ne 0 && echo "$2" | grep -q "already runs the firmware"' sh "$code" "$out"
+stop_boards
+in_root sed -i "s/^FirmwareUpdate: .*/FirmwareUpdate: false/" "$RSP_ROOT/config.yaml"
+in_root systemctl restart ptyserver.service
+for _ in $(seq 1 20); do in_root ss -H -tln | grep -q " $BIND_IP:$PORT " && break; sleep 0.5; done
+
+# ---------------------------------------------------------------------------
 step "the provisioning scripts take everything from config.yaml"
 # No Pico here, so stand in for rshell and for the WiFi lookup: what matters is
 # the port and address the deployer would write to a board, and that the WiFi
@@ -372,7 +424,7 @@ expect_ok "deployer puts the WiFi password on the board" grep -q 'password-deliv
 leak=$(in_root grep -rl -- "$WIFI_PW" "$RSP_ROOT" /tmp /run /var/tmp 2>/dev/null)
 if [ -z "$leak" ]; then pass "the WiFi password is left nowhere on disk"; else fail "WiFi password left in: $leak"; fi
 expect_ok "deployer logged to the root-owned log" in_root grep -q 'pico_id=e661abcd00000000' "$RSP_ROOT/log/deployer.log"
-WANT_FILES="firmware.json $(in_root python3 -c "import json,sys; print(' '.join(json.load(open(sys.argv[1]))['files']))" "$RSP_ROOT/app/src/pico/firmware.json") config.json"
+WANT_FILES="firmware.json $(in_root python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(' '.join(m['files'] + m.get('usb_only', [])))" "$RSP_ROOT/app/src/pico/firmware.json") update.json config.json"
 expect_ok "deployer copies every firmware file the manifest names" grep -qx "files $WANT_FILES" <<<"$out"
 
 # Phase D: the deployer gave that board a key and recorded it for the server.

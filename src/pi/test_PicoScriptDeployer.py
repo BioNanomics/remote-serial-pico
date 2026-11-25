@@ -245,6 +245,7 @@ class TestConfigAndTransfer(unittest.TestCase):
             board = cmd[-2]
             seen['cmd'] = cmd
             seen['config'] = json.load(open(board))
+            seen['marker'] = json.load(open(cmd[-3]))
             seen['dir'] = os.path.dirname(board)
             seen['mode'] = os.stat(seen['dir']).st_mode & 0o777
             return 0
@@ -261,8 +262,12 @@ class TestConfigAndTransfer(unittest.TestCase):
                          (6001, '10.42.0.1', 'e661abcd'))
         self.assertEqual(seen['mode'], 0o700)
         self.assertFalse(os.path.exists(seen['dir']), 'the directory holding the WiFi password must be removed')
-        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]], D.firmware_files() + ['config.json'])
-        self.assertTrue(all(os.path.isfile(x) for x in seen['cmd'][4:-2]), 'firmware files are found next to the script')
+        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]],
+                         D.firmware_files() + D.usb_only_files() + ['update.json', 'config.json'])
+        self.assertIn('boot.py', D.usb_only_files(), 'the recovery path is deployed over USB')
+        self.assertEqual(seen['marker'], {'files': [], 'boots': 0},
+                         'a USB deploy clears whatever an earlier over-the-air update left behind')
+        self.assertTrue(all(os.path.isfile(x) for x in seen['cmd'][4:-3]), 'firmware files are found next to the script')
         logged = open(log).read()
         self.assertIn('Pico detected', logged)
 
@@ -403,7 +408,8 @@ class TestRecordDeviceKey(unittest.TestCase):
         files = D.firmware_files()
         self.assertEqual(files[0], 'firmware.json')
         on_disk = sorted(n for n in os.listdir(D.PICO_SRC_DIR) if n.endswith('.py') and not n.startswith('test_'))
-        self.assertEqual(sorted(files[1:]), on_disk, 'every module the board imports must be deployed')
+        self.assertEqual(sorted(files[1:] + D.usb_only_files()), on_disk, 'every module the board imports must be deployed')
+        self.assertFalse(set(files) & set(D.usb_only_files()), 'boot.py is never part of an over-the-air update')
         for name in D.firmware_files():
             self.assertTrue(os.path.isfile(os.path.join(D.PICO_SRC_DIR, name)), name)
 

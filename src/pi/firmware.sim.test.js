@@ -15,7 +15,8 @@ const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const F = require('./frame.js');
 const { PicoSession } = require('./session.js');
-const { firmwareHash } = require('./runtime.js');
+const { firmwareHash, firmwareBundle } = require('./runtime.js');
+const os = require('os');
 
 const PYTHON = process.env.PYTHON || 'python3';
 const havePython = spawnSync(PYTHON, ['--version']).status === 0;
@@ -45,7 +46,10 @@ async function waitFor(check, what, timeoutMs = 8000) {
 // refusal test, where the server must misbehave on purpose).
 // `boardKey` is what the board holds (null: never provisioned); `serverKey` is
 // what the Pi has on record for it.
-async function bench(t, { env = {}, onConnection, boardKey = KEY, serverKey = KEY, sessionOptions = {} } = {}) {
+// `src` is the firmware the board starts with; `reboot` powers it back on
+// after a reset, files intact, the way hardware does. `hooks` adds to or
+// replaces the session's hooks (the firmware-update ones, for instance).
+async function bench(t, { env = {}, onConnection, boardKey = KEY, serverKey = KEY, sessionOptions = {}, src = null, reboot = false, hooks = {} } = {}) {
     const state = { registrations: [], data: [], frames: [], sockets: [], stdout: [], log: [], exitCode: null };
     const server = net.createServer((socket) => {
         state.sockets.push(socket);
@@ -60,7 +64,9 @@ async function bench(t, { env = {}, onConnection, boardKey = KEY, serverKey = KE
             secretFor: (id) => (id === ID ? serverKey : null),
             register: (id, info) => { state.registrations.push({ id, ...info }); return 'sim-board'; },
             onData: (payload) => state.data.push(payload),
+            ...hooks,
         }, sessionOptions);
+        socket.on('close', () => session.connectionLost());
         socket.on('data', (buf) => session.receive(buf));
         state.session = session;
     });
@@ -69,6 +75,8 @@ async function bench(t, { env = {}, onConnection, boardKey = KEY, serverKey = KE
 
     const args = ['-u', RUNNER, '--host', '127.0.0.1', '--port', String(port), '--id', ID];
     if (boardKey) args.push('--key', boardKey.toString('hex'));
+    if (src) args.push('--src', src);
+    if (reboot) args.push('--reboot');
     const child = spawn(PYTHON, args,
         { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
     let pending = '';
@@ -82,6 +90,7 @@ async function bench(t, { env = {}, onConnection, boardKey = KEY, serverKey = KE
     child.on('exit', (code) => { state.exitCode = code; });
 
     t.after(() => {
+        try { child.stdin.write('EXIT\n'); } catch { /* already gone */ }   // ends a rebooted board too
         child.kill('SIGKILL');
         for (const s of state.sockets) s.destroy();
         server.close();
@@ -312,4 +321,120 @@ test('an unknown control command is refused by the board and changes nothing', {
     const answer = await b.state.session.control('format_flash');
     assert.deepStrictEqual(answer, { ok: false, error: 'unknown command: format_flash' });
     assert.strictEqual(b.state.exitCode, null);
+});
+
+// --- firmware update over the air (Phase F): the acceptance criteria -------------------
+
+// A copy of the firmware with main.py changed: `edit` gets the source and returns the new one.
+function firmwareCopy(t, edit) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsp-fw-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const manifest = JSON.parse(fs.readFileSync(path.join(PICO_SRC, 'firmware.json'), 'utf8'));
+    for (const name of ['firmware.json', ...manifest.files, ...manifest.usb_only]) fs.copyFileSync(path.join(PICO_SRC, name), path.join(dir, name));
+    fs.writeFileSync(path.join(dir, 'main.py'), edit(fs.readFileSync(path.join(dir, 'main.py'), 'utf8')));
+    return dir;
+}
+const boardFiles = (b) => fs.readdirSync(boardDir(b)).sort();
+
+test('a firmware change on the Pi reaches the board on its next connection, verified, with both versions logged', { skip }, async (t) => {
+    const old = firmwareCopy(t, (src) => src + '\n# an older build\n');
+    const oldHash = firmwareHash(old), newHash = firmwareHash(PICO_SRC);
+    assert.notStrictEqual(oldHash, newHash);
+    const finished = [];
+    const b = await bench(t, {
+        src: old, reboot: true, sessionOptions: { firmwareHash: newHash },
+        hooks: { offerUpdate: () => firmwareBundle(PICO_SRC), updateFinished: (id, ok, detail) => finished.push({ id, ok, detail }) },
+    });
+
+    await waitFor(() => b.seen(/\[OTA\] Update verified/), 'the board to verify the update', 20000);
+    assert.strictEqual(b.state.registrations.length, 0, 'the update happens before the board is registered: no serial data has moved');
+    assert.strictEqual(b.uartTx().length, 0);
+    await waitFor(() => finished.length === 1, 'the server to hear the result');
+    assert.deepStrictEqual(finished, [{ id: ID, ok: true, detail: { from: oldHash, to: newHash } }]);
+    assert.ok(b.state.log.some((l) => l.includes(`sending hash ${newHash}`) && l.includes(`(hash ${oldHash})`)), 'old and new versions are logged');
+    assert.ok(b.state.log.some((l) => new RegExp(`verified and installed it: .*hash ${oldHash}\\) -> hash ${newHash}`).test(l)), b.state.log.join('\n'));
+
+    await waitFor(() => b.seen(/^MACHINE-RESET$/), 'the board to restart');
+    await waitFor(() => b.seen(/\[BOOT\] New firmware on trial, start 1 of 3/), 'boot.py to put the new firmware on trial');
+    await waitFor(() => b.state.registrations.length === 1, 'the board to come back and register', 20000);
+    assert.strictEqual(b.state.registrations[0].hash, newHash, 'it now reports the firmware the Pi deploys');
+    await waitFor(() => b.seen(/\[OTA\] New firmware confirmed/), 'the new firmware to confirm itself');
+    assert.ok(!boardFiles(b).some((n) => n.endsWith('.bak') || n.endsWith('.new') || n === 'update.json'),
+        `nothing left over on the board: ${boardFiles(b)}`);
+    assert.strictEqual(fs.readFileSync(path.join(boardDir(b), 'main.py'), 'utf8'), fs.readFileSync(MAIN_PY, 'utf8'));
+    assert.strictEqual(boardConfig(b).KEY, KEY.toString('hex'), 'the device key survives an update');
+
+    // And it works: the relay carries data on the new firmware.
+    b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    await waitFor(() => b.uartTx().length === 1, 'UART-TX on the new firmware');
+});
+
+test('a corrupted update is rejected and the board keeps running the previous firmware', { skip }, async (t) => {
+    const old = firmwareCopy(t, (src) => src + '\n# an older build\n');
+    const oldHash = firmwareHash(old);
+    const corrupt = () => {
+        const bundle = firmwareBundle(PICO_SRC);
+        const victim = bundle.files.find((f) => f.name === 'net_util.py');
+        victim.data = Buffer.from(victim.data);
+        victim.data[200] ^= 0x01;                       // one bit flipped after the hash was taken
+        return bundle;
+    };
+    const finished = [];
+    const b = await bench(t, {
+        src: old, reboot: true, sessionOptions: { firmwareHash: firmwareHash(PICO_SRC), firmwareMismatch: 'warn' },
+        hooks: { offerUpdate: corrupt, updateFinished: (id, ok, detail) => finished.push({ ok, detail }) },
+    });
+    await waitFor(() => b.seen(/\[OTA\] Update rejected: net_util\.py: sha256 does not match/), 'the board to reject it', 20000);
+    await waitFor(() => finished.length === 1, 'the server to hear the refusal');
+    assert.deepStrictEqual(finished, [{ ok: false, detail: 'net_util.py: sha256 does not match' }]);
+    assert.ok(!b.seen(/MACHINE-RESET/), 'a rejected update does not restart the board');
+    await waitFor(() => b.state.registrations.length === 1, 'the board to be served on what it has (warn policy)');
+    assert.strictEqual(b.state.registrations[0].hash, oldHash);
+    assert.ok(!boardFiles(b).some((n) => n.endsWith('.new') || n.endsWith('.bak')), `no half-update left: ${boardFiles(b)}`);
+    b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    await waitFor(() => b.uartTx().length === 1, 'the old firmware to keep relaying');
+});
+
+test('firmware that verifies but does not start is rolled back by boot.py, and the board returns on the old one', { skip }, async (t) => {
+    // The update the reviewer worried about: a valid, correctly hashed image whose main.py crashes on import.
+    const broken = firmwareCopy(t, () => 'raise RuntimeError("this build is broken")\n');
+    const good = firmwareHash(PICO_SRC);
+    let offers = 0;
+    const b = await bench(t, {
+        reboot: true, sessionOptions: { firmwareHash: firmwareHash(broken), firmwareMismatch: 'warn' },
+        hooks: { offerUpdate: () => (offers++ === 0 ? firmwareBundle(broken) : null) },
+    });
+    await waitFor(() => b.seen(/\[OTA\] Update verified/), 'the board to accept the (valid but broken) image', 20000);
+    await waitFor(() => b.seen(/this build is broken/), 'the new main.py to crash');
+    await waitFor(() => b.seen(/\[BOOT\] New firmware on trial, start 3 of 3/), 'three failed starts', 20000);
+    await waitFor(() => b.seen(/\[BOOT\] Previous firmware restored/), 'boot.py to restore the old firmware', 20000);
+    await waitFor(() => b.state.registrations.length === 1, 'the board to come back on the firmware it had', 20000);
+    assert.strictEqual(b.state.registrations[0].hash, good);
+    assert.strictEqual(b.state.stdout.filter((l) => /^WDT-RESET main\.py crashed/.test(l)).length, 3, 'each failed start ended in a watchdog reset, not a dead board');
+    assert.ok(!boardFiles(b).some((n) => n.endsWith('.bak') || n === 'update.json'), `rollback cleaned up: ${boardFiles(b)}`);
+    b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    await waitFor(() => b.uartTx().length === 1, 'the restored firmware to relay');
+});
+
+test('an update is never accepted from a server that does not hold the key', { skip }, async (t) => {
+    const before = fs.readFileSync(MAIN_PY, 'utf8');
+    const b = await bench(t, {
+        onConnection: (socket) => {
+            const decoder = new F.Decoder();
+            let seq = 0;
+            socket.on('data', (buf) => {
+                for (const f of decoder.feed(buf)) {
+                    if (f.opcode === F.OPCODE.REGISTER) socket.write(F.encode(F.OPCODE.AUTH_CHALLENGE, seq++, crypto.randomBytes(32)));
+                    if (f.opcode === F.OPCODE.AUTH_RESPONSE) {
+                        const evil = Buffer.from('import os\n');
+                        socket.write(F.encodeJson(F.OPCODE.UPDATE_OFFER, seq++, { name: 'main.py', len: evil.length, sha256: crypto.createHash('sha256').update(evil).digest('hex') }));
+                    }
+                }
+            });
+        },
+    });
+    await waitFor(() => b.seen(/firmware update from a server that did not prove it holds the device key/), 'the board to refuse');
+    assert.ok(!b.seen(/\[OTA\] The Pi is offering/));
+    assert.ok(!boardFiles(b).some((n) => n.endsWith('.new')));
+    assert.strictEqual(fs.readFileSync(path.join(boardDir(b), 'main.py'), 'utf8'), before);
 });

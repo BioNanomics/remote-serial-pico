@@ -277,8 +277,11 @@ class TestFirmwareHash(unittest.TestCase):
         # Every module the board runs must be listed, or a change to it would
         # be invisible. Checked against the directory, so a new file cannot be
         # forgotten.
+        with open(os.path.join(self.SRC, 'firmware.json')) as fh:
+            usb_only = json.load(fh).get('usb_only', [])
         on_disk = sorted(n for n in os.listdir(self.SRC) if n.endswith('.py') and not n.startswith('test_'))
-        self.assertEqual(sorted(names[1:]), on_disk)
+        self.assertEqual(sorted(names[1:] + usb_only), on_disk)
+        self.assertEqual(usb_only, ['boot.py'], 'the recovery path is outside the hash: it is never updated over the air')
         for changed in names:
             with tempfile.TemporaryDirectory() as d:
                 for name in names:
@@ -523,10 +526,83 @@ class TestPicoLink(unittest.TestCase):
         events = link.receive(F.encode_json(F.OP_ERROR, 0, {'code': 4, 'msg': 'authenticate first'}))
         self.assertEqual(events, [('error', (4, 'authenticate first'))])
 
-    def test_later_phase_opcodes_are_ignored_without_an_error(self):
+    def test_opcodes_out_of_place_are_ignored_without_an_error(self):
         link = self.link(registered=True)
-        for op in (F.OP_UPDATE_OFFER,):
+        for op in (F.OP_UPDATE_CHUNK, F.OP_UPDATE_RESULT, F.OP_AUTH_CHALLENGE, F.OP_REGISTER):
             self.assertEqual(link.receive(self.pi.sealed(op, b'\x00')), [('ignored', op)], hex(op))
+
+    # --- firmware update (Phase F) ---------------------------------------------
+
+    OFFER = {'name': 'main.py', 'len': 3, 'sha256': 'a' * 64}
+
+    def offer(self, obj=None):
+        return self.pi.sealed(F.OP_UPDATE_OFFER, json.dumps(obj or self.OFFER).encode())
+
+    def test_an_update_is_only_accepted_before_registration_never_mid_operation(self):
+        link = self.link(registered=True)
+        events = link.receive(self.offer())
+        self.assertEqual([k for k, _ in events], ['send'])
+        op, body = self.pi.opened(events[0][1])
+        self.assertEqual(op, F.OP_UPDATE_RESULT)
+        self.assertEqual(json.loads(body), {'ok': False, 'msg': 'updates are only accepted before registration'})
+
+    def test_an_authenticated_offer_and_its_chunks_are_handed_to_main_before_registration(self):
+        link = self.link()
+        link.receive(self.pi.challenge())
+        self.assertEqual(link.receive(self.offer()), [('update_offer', self.OFFER)])
+        chunk = b'\x00\x00\x00\x00abc'
+        self.assertEqual(link.receive(self.pi.sealed(F.OP_UPDATE_CHUNK, chunk)), [('update_chunk', chunk)])
+        self.assertFalse(link.registered, 'receiving an update is not being registered: no serial data moves')
+        self.assertEqual(link.data_frames(b'x'), [])
+        # The frame counters carry straight on into a normal registration.
+        self.assertEqual(link.receive(self.pi.ack()), [('registered', 'office-north')])
+
+    def test_firmware_is_never_accepted_from_a_server_that_has_not_proved_the_key(self):
+        offer = json.dumps(self.OFFER).encode()
+        # Before any challenge: there are no session keys at all.
+        link = self.link()
+        self.assertEqual(link.receive(F.encode(F.OP_UPDATE_OFFER, 0, offer))[0][0], 'close')
+        # After the challenge, but untagged or with a made-up tag.
+        for forged in (offer, offer + b'\x00' * 16):
+            link = self.link()
+            link.receive(self.pi.challenge())
+            events = link.receive(F.encode(F.OP_UPDATE_OFFER, 1, forged))
+            self.assertEqual([k for k, _ in events], ['close'])
+            self.assertIn('did not prove', events[0][1])
+        link = self.link()
+        link.receive(self.pi.challenge())
+        self.assertEqual(link.receive(F.encode(F.OP_UPDATE_CHUNK, 1, b'\x00\x00\x00\x00evil' + b'\x00' * 16))[0][0], 'close')
+        # Tagged with a different board's key.
+        link = self.link()
+        link.receive(self.pi.challenge())
+        other = FakePi(self.ID, key=bytes(32))
+        self.assertEqual(link.receive(other.sealed(F.OP_UPDATE_OFFER, offer))[0][0], 'close')
+
+    def test_an_offer_that_is_not_an_object_is_refused(self):
+        link = self.link()
+        link.receive(self.pi.challenge())
+        events = link.receive(self.pi.sealed(F.OP_UPDATE_OFFER, b'[1, 2]'))
+        op, body = self.pi.opened(events[0][1])
+        self.assertEqual((op, json.loads(body)['ok']), (F.OP_UPDATE_RESULT, False))
+
+    def test_update_result_carries_the_new_hash_only_on_success(self):
+        link = self.link(registered=True)
+        self.assertEqual(json.loads(self.pi.opened(link.update_result(True, 'verified; restarting', 'abcd'))[1]),
+                         {'ok': True, 'msg': 'verified; restarting', 'hash': 'abcd'})
+        self.assertEqual(json.loads(self.pi.opened(link.update_result(False, 'main.py: truncated'))[1]),
+                         {'ok': False, 'msg': 'main.py: truncated'})
+
+    def test_firmware_hash_of_a_staged_update_reads_the_new_files_under_their_real_names(self):
+        src = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(src, 'firmware.json')) as fh:
+            names = ['firmware.json'] + json.load(fh)['files']
+        with tempfile.TemporaryDirectory() as d:
+            for name in names:
+                with open(os.path.join(src, name), 'rb') as a, open(os.path.join(d, name + '.new'), 'wb') as b:
+                    b.write(a.read())
+            self.assertEqual(N.firmware_hash(d, suffix='.new'), N.firmware_hash(src),
+                             'a board that installs these files will report exactly this hash')
+            self.assertEqual(N.firmware_hash(d), 'unknown', 'nothing live is there yet')
 
     # --- control channel (Phase E) ---------------------------------------------
 

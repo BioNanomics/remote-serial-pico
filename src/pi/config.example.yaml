@@ -55,3 +55,11 @@ BindAddress: '@BIND@'
 #   refuse   turn it away until it is plugged into this Pi again (the default)
 #   warn     serve it and log a warning
 FirmwareMismatch: refuse
+# Firmware updates over the air. With true, a board whose firmware is not what
+# this Pi deploys is sent the new firmware when it connects, before it is
+# served, one board at a time; it verifies every file before replacing
+# anything and goes back to its previous firmware if the new one does not
+# start. With false (the default) nothing is ever sent unless you ask for one
+# board:  remote-serial-pico ctl <name> update.  Try one board that way before
+# turning this on.
+FirmwareUpdate: false

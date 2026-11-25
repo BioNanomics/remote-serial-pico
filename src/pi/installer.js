@@ -1047,7 +1047,7 @@ function usage() {
         '  status       is the service up, which Picos are connected and on what firmware',
         '  ctl <name> <command>',
         '               control one board: status, reboot, identify [seconds],',
-        '               uart set <baud> [bits parity stop] [--save], listen',
+        '               uart set <baud> [bits parity stop] [--save], listen, update',
         '',
         'options:',
         `  --root <dir>           install root (default ${DEFAULT_ROOT}); everything lives under it.`,

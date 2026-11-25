@@ -15,6 +15,8 @@ const USAGE = [
     '           [--save]                     Lasts until the board restarts unless --save is given,',
     '                                        so a wrong setting is undone by a power cycle',
     '  listen                                show the serial traffic, hex, until Ctrl-C',
+    '  update                                update this one board to the firmware this Pi deploys,',
+    '                                        even when FirmwareUpdate is off: try one board first',
     '',
     '<name> is the port name from `remote-serial-pico status`.',
     ''
@@ -35,6 +37,7 @@ function parseCtl(argv) {
             case 'status':
             case 'reboot':
             case 'listen':
+            case 'update':
                 if (rest.length || save) return { error: `${cmd} takes no arguments` };
                 return { pico, cmd, args: {} };
             case 'identify':
@@ -57,6 +60,7 @@ function parseCtl(argv) {
 }
 
 function formatResult(cmd, result) {
+    if (cmd === 'update' && result && result.note) return result.note;
     if (cmd !== 'status' || !result || typeof result !== 'object') return JSON.stringify(result);
     const label = {
         fw: 'firmware', hash: 'firmware hash', uptime_s: 'uptime (s)', rssi: 'WiFi signal (dBm)', free_mem: 'free memory (bytes)',

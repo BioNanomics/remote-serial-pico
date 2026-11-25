@@ -1,3 +1,4 @@
 {
-    "files": ["main.py", "net_util.py", "frame.py", "auth.py", "control.py"]
+    "files": ["main.py", "net_util.py", "frame.py", "auth.py", "control.py", "update.py"],
+    "usb_only": ["boot.py"]
 }

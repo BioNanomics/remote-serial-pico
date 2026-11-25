@@ -111,12 +111,12 @@ test('only the commands on the list are forwarded to a board', async (t) => {
     const board = fakeSession();
     const { socketPath } = await server(t, { B: board });
     const out = [], err = [];
-    for (const cmd of ['update', 'rotate-key', 'exec', '__proto__', 'constructor']) {
+    for (const cmd of ['rotate-key', 'exec', '__proto__', 'constructor']) {
         const code = await ctl.run({ pico: 'B', cmd, args: {} }, socketPath, (s) => out.push(s), (s) => err.push(s));
         assert.strictEqual(code, 1, cmd);
     }
     assert.deepStrictEqual(board.asked, []);
-    assert.match(err[0], /unknown command: update/);
+    assert.match(err[0], /unknown command: rotate-key/);
 });
 
 test('garbage on the socket gets an error, not a crash', async (t) => {
@@ -163,4 +163,28 @@ test('ctl explains a missing or forbidden socket instead of printing a stack tra
     const r = await runCtl(['B', 'status'], path.join(os.tmpdir(), 'rc-does-not-exist.sock'));
     assert.strictEqual(r.code, 1);
     assert.match(r.err, /is ptyserver\.service running\?/);
+});
+
+test('ctl update asks the server, not the board, and works for a board that is not connected', async (t) => {
+    const asked = [];
+    const log = [];
+    const socketPath = sockPath();
+    const srv = new ControlServer({
+        socketPath, sessionFor: () => null, names: () => [], log: (level, msg) => log.push(`${level}: ${msg}`),
+        requestUpdate: (name) => { asked.push(name); return name === 'Blinds_pico'
+            ? { ok: true, result: { update: 'armed', note: 'Blinds_pico is not connected; it will be updated the next time it connects' } }
+            : { ok: false, error: `${name} is not a known board` }; },
+    });
+    await new Promise((r) => srv.start(r));
+    t.after(() => srv.stop());
+    assert.deepStrictEqual(ctl.parseCtl(['Blinds_pico', 'update']), { pico: 'Blinds_pico', cmd: 'update', args: {} });
+    let r = await runCtl(['Blinds_pico', 'update'], socketPath);
+    assert.strictEqual(r.code, 0);
+    assert.match(r.out, /it will be updated the next time it connects/);
+    r = await runCtl(['Nobody', 'update'], socketPath);
+    assert.strictEqual(r.code, 1);
+    assert.match(r.err, /Nobody is not a known board/);
+    assert.deepStrictEqual(asked, ['Blinds_pico', 'Nobody']);
+    assert.ok(log.some(l => /^info: control: update \{\} for "Blinds_pico" => ok/.test(l)));
+    assert.ok(log.some(l => /^warn: control: update \{\} for "Nobody" => refused/.test(l)));
 });
