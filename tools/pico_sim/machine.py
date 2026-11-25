@@ -5,6 +5,7 @@ process's stdin/stdout so a test can play the serial device:
 
   stdin   UART-RX <hex>      bytes the device "sends" (main.py reads them)
   stdout  UART-TX <hex>      bytes main.py wrote to the device
+  stdout  UART-INIT <baud> <bits> <parity> <stop>   the serial settings in force
 
 The watchdog is real in the one way that matters: a feed gap longer than the
 timeout ends the process with exit code 3, the way the RP2040 would reset.
@@ -65,8 +66,9 @@ class UART:
     def __init__(self, uart_id, baudrate=9600, **kwargs):
         self.uart_id = uart_id
 
-    def init(self, *args, **kwargs):
-        pass
+    def init(self, baudrate=9600, bits=8, parity=None, stop=1, **kwargs):
+        # Reported so a test can see the serial link being retuned.
+        _say('UART-INIT %d %d %s %d' % (baudrate, bits, {None: 'N', 0: 'E', 1: 'O'}.get(parity, '?'), stop))
 
     def any(self):
         with _rx_lock:

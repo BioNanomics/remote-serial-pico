@@ -1,3 +1,3 @@
 {
-    "files": ["main.py", "net_util.py", "frame.py", "auth.py"]
+    "files": ["main.py", "net_util.py", "frame.py", "auth.py", "control.py"]
 }

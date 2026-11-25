@@ -60,7 +60,7 @@ const SYSTEM = Object.freeze({
     aptPackages: ['python3', 'python3-venv', 'python3-pip', 'build-essential', 'udisks2']
 });
 
-const CONFIG_KEYS = ['PicoSerialMap', 'PicoSecrets', 'StateFile', 'symlinkDir', 'FirmwareDir', 'DeployerLog',
+const CONFIG_KEYS = ['PicoSerialMap', 'PicoSecrets', 'StateFile', 'ControlSocket', 'symlinkDir', 'FirmwareDir', 'DeployerLog',
     'SyslogDir', 'CustomlogDir', 'TCP_PORT', 'BindAddress'];
 
 // ---------------------------------------------------------------------------
@@ -187,6 +187,12 @@ function readInstalledUnit(fsx, unitPath) {
     const user = /^User=(\S+)\s*$/m.exec(text);
     if (!execStart) return null;
     return { nodePath: execStart[1], configPath: execStart[2], root: path.dirname(execStart[2]), user: user ? user[1] : null };
+}
+
+// For `ctl`: the control socket of the install this command belongs to.
+function controlSocketPath(ctx) {
+    const conf = readConfig(ctx);
+    return conf && conf.ControlSocket ? conf.ControlSocket : null;
 }
 
 function makeContext(overrides = {}) {
@@ -907,6 +913,16 @@ function doctorChecks(ctx) {
     add('service enabled at boot', enabled === 'enabled', enabled || 'not enabled', `sudo systemctl enable ${c.unitName}`);
     add('service running', active === 'active', active || 'inactive', `sudo systemctl start ${c.unitName}; sudo journalctl -u ${c.unitName} -n 30`);
 
+    if (conf && conf.ControlSocket) {
+        // The server creates this when it starts; `ctl` cannot work without it.
+        const st = stat(conf.ControlSocket);
+        const isSocket = !!st && st.isSocket();
+        const groupOnly = isSocket && (st.mode & 0o007) === 0;
+        add('control socket', isSocket && groupOnly,
+            !st ? `${conf.ControlSocket} missing` : (!isSocket ? `${conf.ControlSocket} is not a socket` : (groupOnly ? conf.ControlSocket : `${conf.ControlSocket} is open to everyone (${(st.mode & 0o777).toString(8)})`)),
+            `sudo systemctl restart ${c.unitName}`);
+    }
+
     const ls = listenState(ctx, conf);
     let listenDetail, listenHint;
     if (ls.ok) {
@@ -1029,6 +1045,9 @@ function usage() {
         '               overwritten. Needs sudo.',
         '  doctor       check every component and say how to fix what is wrong',
         '  status       is the service up, which Picos are connected and on what firmware',
+        '  ctl <name> <command>',
+        '               control one board: status, reboot, identify [seconds],',
+        '               uart set <baud> [bits parity stop] [--save], listen',
         '',
         'options:',
         `  --root <dir>           install root (default ${DEFAULT_ROOT}); everything lives under it.`,
@@ -1049,5 +1068,5 @@ module.exports = {
     treeFiles, treeHash, readStamp,
     packageInstalled, stepAptPackages, stepServiceUser, stepDirectories, stepApp, stepVenv, stepConfig, stepState,
     stepUdevRules, stepFirewall, stepService, stepVerify, stepFirmware, listeners, listenState, picoSubnet,
-    INSTALL_STEPS, install, doctorChecks, doctor, status, usage
+    INSTALL_STEPS, install, doctorChecks, doctor, status, usage, controlSocketPath, readConfig
 };

@@ -50,6 +50,8 @@ class PicoSession {
         this.pending = null;       // { key, nonce } between AUTH_CHALLENGE and AUTH_RESPONSE
         this.tx = null;            // A.Tagger, pi -> pico, once authenticated
         this.rx = null;            // A.Tagger, pico -> pi
+        this.requests = new Map(); // control request id -> { resolve, timer, cmd }
+        this.nextRequestId = 1;
         this.closed = false;
         this.stats = { frames: 0, dataIn: 0, dataOut: 0, pings: 0, dropped: 0 };
     }
@@ -86,9 +88,55 @@ class PicoSession {
         }
     }
 
+    // Send one control command to the board and resolve with its answer:
+    // { ok: true, result } or { ok: false, error }. Never rejects. Control
+    // traffic has its own opcodes and never touches the pty (the data path
+    // rule), and like every frame after the handshake it is authenticated, so
+    // a board only ever acts on a command from the Pi that holds its key.
+    control(cmd, args = {}, timeoutMs = 5000) {
+        if (!this.registered || this.closed) return Promise.resolve({ ok: false, error: 'board is not connected' });
+        const id = this.nextRequestId++;
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                this.requests.delete(id);
+                resolve({ ok: false, error: `no answer from the board within ${timeoutMs / 1000} s` });
+            }, timeoutMs);
+            this.requests.set(id, { resolve, timer, cmd });
+            this.sendJson(F.OPCODE.CONTROL_REQUEST, { id, cmd, args });
+        });
+    }
+
+    onControlResponse(body) {
+        const res = F.decodeJson(body);
+        const pending = res && this.requests.get(res.id);
+        if (!pending) {
+            this.hooks.log('warn', `${this.who()} sent a CONTROL_RESPONSE nobody is waiting for; ignored`);
+            return;
+        }
+        clearTimeout(pending.timer);
+        this.requests.delete(res.id);
+        pending.resolve(res.ok === true
+            ? { ok: true, result: res.result === undefined ? {} : res.result }
+            : { ok: false, error: printable(res.error === undefined ? 'the board reported a failure' : res.error, 200) });
+    }
+
+    failRequests(reason) {
+        for (const [id, pending] of this.requests) {
+            clearTimeout(pending.timer);
+            pending.resolve({ ok: false, error: reason });
+            this.requests.delete(id);
+        }
+    }
+
+    // The socket is gone (PtyServer calls this from its close handler too).
+    connectionLost() {
+        this.failRequests('the board disconnected before answering');
+    }
+
     close() {
         if (this.closed) return;
         this.closed = true;
+        this.failRequests('the connection was closed before the board answered');
         this.hooks.close();
     }
 
@@ -148,6 +196,7 @@ class PicoSession {
             case F.OPCODE.PING: return this.onPing();
             case F.OPCODE.DATA: return this.onData(body);
             case F.OPCODE.ERROR: return this.onError(body);
+            case F.OPCODE.CONTROL_RESPONSE: return this.onControlResponse(body);
             case F.OPCODE.PONG: return;   // we never PING in v1, but it is legal
             default: return this.onOther(frame.opcode);
         }
