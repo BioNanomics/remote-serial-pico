@@ -66,8 +66,8 @@ opaque.
 | `0x10` | `DATA` | either | bytes: raw UART traffic | B |
 | `0x20` | `AUTH_CHALLENGE` | Pi → Pico | bytes: 32-byte server nonce | D |
 | `0x21` | `AUTH_RESPONSE` | Pico → Pi | bytes: 32-byte Pico nonce + 32-byte HMAC-SHA256 proof | D |
-| `0x30` | `CONTROL_REQUEST` | Pi → Pico | JSON `{"cmd": str, "args": {...}}` | E |
-| `0x31` | `CONTROL_RESPONSE` | Pico → Pi | JSON `{"ok": bool, "result": {...}}` | E |
+| `0x30` | `CONTROL_REQUEST` | Pi → Pico | JSON `{"id": int, "cmd": str, "args": {...}}` | E |
+| `0x31` | `CONTROL_RESPONSE` | Pico → Pi | JSON `{"id": int, "ok": bool, "result": {...}}` or `{"id": int, "ok": false, "error": str}` | E |
 | `0x40` | `UPDATE_OFFER` | Pi → Pico | JSON `{"len": int, "sha256": hex}` | F |
 | `0x41` | `UPDATE_CHUNK` | Pi → Pico | bytes: 4-byte BE offset + data | F |
 | `0x42` | `UPDATE_RESULT` | Pico → Pi | JSON `{"ok": bool, "msg": str}` | F |
@@ -268,6 +268,53 @@ the sender of an `ERROR` decides for itself whether to close the connection.
 | 4 | frame received before registration completed | ignore the frame |
 | 5 | registration refused | close (carried in `REGISTER_ACK` too) |
 
+## Control channel
+
+A `CONTROL_REQUEST` asks the board to do something to itself. It is only ever
+sent, and only ever acted on, inside an authenticated session: like every
+frame after the handshake it carries a tag, so a board runs a command only if
+it came from the Pi that holds its key. An unauthenticated `reboot` would be a
+one-packet outage for the whole building; an unauthenticated `uart_set` would
+silently cut a board off from its serial device.
+
+Control traffic has its own opcodes and is consumed by the firmware and by
+`PtyServer`. By the data path rule it never reaches the UART and never
+appears in the pty.
+
+`id` is chosen by the Pi and echoed in the response, so answers can be
+matched to requests. The board answers every request, with `ok` false and an
+`error` string if it cannot do what was asked.
+
+| `cmd` | `args` | Effect | `result` |
+| --- | --- | --- | --- |
+| `status` | none | none | `fw`, `hash`, `uptime_s`, `rssi`, `free_mem`, `connections`, `uart` (e.g. `"19200 8N1"`), `uart_rx_bytes`, `uart_tx_bytes`, `uart_errors`. A value the board cannot measure is `null` |
+| `reboot` | none | answers, then `machine.reset()` | `{"rebooting": true}` |
+| `identify` | `seconds` 1–300, default 10 | blinks the LED for that long; the relay keeps running | `{"blinking_for": n}` |
+| `uart_set` | `baud` 300–921600, `bits` 7 or 8, `parity` `"N"`/`"E"`/`"O"`, `stop` 1 or 2, `save` bool; all optional | re-initialises the UART with the given values, keeping the others | `{"uart": "9600 8N1", "saved": bool}` |
+
+**UART changes are session-only unless `save` is true.** Without it nothing is
+written to flash, so a wrong baud rate is undone by power-cycling the board.
+With it the settings are stored in the board's `config.json` (`UART`) and
+used at every boot.
+
+A command name the board does not know, or arguments it cannot accept, gets
+`ok` false and changes nothing.
+
+**On the Pi**, operators do not speak this protocol. `PtyServer` listens on a
+Unix domain socket (`ControlSocket` in `config.yaml`, mode `0660` for the
+service's group) and `remote-serial-pico ctl <name> <command>` talks to that.
+One request per connection, one line of JSON each way:
+`{"pico": name, "cmd": str, "args": {...}}` answered by
+`{"ok": true, "result": {...}}` or `{"ok": false, "error": str}`. Every
+command and its result is logged. `listen` is served by `PtyServer` itself: it
+copies the board's `DATA` traffic, hex-encoded, to the client until it
+disconnects, and sends nothing to the board.
+
+`update` (Phase F) and `rotate-key` are named in the issue's command list and
+are not part of this revision. A key should not be sent over a link that is
+authenticated but not encrypted, so `rotate-key` waits for Phase G; until
+then a key is rotated by plugging the board into the Pi.
+
 ## Sequence numbers
 
 The sender increments `SEQ` on every frame it sends, wrapping at `0xFFFF`.
@@ -309,7 +356,7 @@ TCP connect
      UART bytes available     -> send DATA
      DATA received            -> write payload to UART
      every 10 s               -> send PING, expect PONG
-     CONTROL_REQUEST received -> act, send CONTROL_RESPONSE   (Phase E)
+     CONTROL_REQUEST received -> act, send CONTROL_RESPONSE
      UPDATE_* received        -> stage, verify, reply         (Phase F)
      anything else            -> ERROR code 2, keep going
 ```
@@ -355,6 +402,8 @@ frame.
 | Pico authentication | `src/pico/auth.py` | `src/pico/test_auth.py` |
 | Pi authentication | `src/pi/auth.js` | `src/pi/session.test.js` |
 | Cross-check | both | `src/pi/interop.test.js`: frames encoded in JS and decoded in Python; proof, session keys, frame tags and firmware hash computed on both sides and compared, under CPython and MicroPython |
+| Control commands (board) | `src/pico/control.py` | `src/pico/test_control.py` |
+| Control socket and CLI (Pi) | `src/pi/control.js`, `src/pi/ctl.js` | `src/pi/control.test.js` |
 | Key provisioning | `src/pi/PicoScriptDeployer.py` | `src/pi/test_PicoScriptDeployer.py` |
 | Key store, firmware hash | `src/pi/runtime.js` | `src/pi/runtime.test.js` |
 | Server | `src/pi/PtyServer.js` | `src/pi/session.test.js` (the protocol logic lives in `session.js`) |

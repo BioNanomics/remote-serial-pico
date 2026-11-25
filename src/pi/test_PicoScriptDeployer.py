@@ -261,8 +261,7 @@ class TestConfigAndTransfer(unittest.TestCase):
                          (6001, '10.42.0.1', 'e661abcd'))
         self.assertEqual(seen['mode'], 0o700)
         self.assertFalse(os.path.exists(seen['dir']), 'the directory holding the WiFi password must be removed')
-        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]],
-                         ['firmware.json', 'main.py', 'net_util.py', 'frame.py', 'auth.py', 'config.json'])
+        self.assertEqual([os.path.basename(x) for x in seen['cmd'][4:-1]], D.firmware_files() + ['config.json'])
         self.assertTrue(all(os.path.isfile(x) for x in seen['cmd'][4:-2]), 'firmware files are found next to the script')
         logged = open(log).read()
         self.assertIn('Pico detected', logged)
@@ -401,7 +400,10 @@ class TestRecordDeviceKey(unittest.TestCase):
         self.assertTrue(os.path.islink(self.path))
 
     def test_firmware_files_come_from_the_manifest(self):
-        self.assertEqual(D.firmware_files(), ['firmware.json', 'main.py', 'net_util.py', 'frame.py', 'auth.py'])
+        files = D.firmware_files()
+        self.assertEqual(files[0], 'firmware.json')
+        on_disk = sorted(n for n in os.listdir(D.PICO_SRC_DIR) if n.endswith('.py') and not n.startswith('test_'))
+        self.assertEqual(sorted(files[1:]), on_disk, 'every module the board imports must be deployed')
         for name in D.firmware_files():
             self.assertTrue(os.path.isfile(os.path.join(D.PICO_SRC_DIR, name)), name)
 

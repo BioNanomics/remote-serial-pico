@@ -234,3 +234,82 @@ test('a radio that refuses to join on first boot is retried, not fatal', { skip 
     assert.ok(b.seen(/Join attempt 2 failed: .*EPERM/));
     assert.ok(!b.seen(/MACHINE-RESET/), 'two failures are below the hardware-reset threshold');
 });
+
+// --- control channel (Phase E): the acceptance criteria, against the real main.py ---
+
+const boardDir = (b) => b.state.stdout.map((l) => /^SIM board=(\S+)/.exec(l)).find(Boolean)[1];
+const boardConfig = (b) => JSON.parse(fs.readFileSync(path.join(boardDir(b), 'config.json'), 'utf8'));
+
+test('status reports firmware, uptime, counters and the serial settings, and nothing reaches the UART', { skip }, async (t) => {
+    const b = await bench(t);
+    await waitFor(() => b.state.session && b.state.session.registered, 'registration');
+    b.uartRx(Buffer.from('255.19.255.QY=FE\r'));
+    await waitFor(() => b.state.data.length === 1, 'some serial traffic to count');
+    const answer = await b.state.session.control('status');
+    assert.strictEqual(answer.ok, true, JSON.stringify(answer));
+    const fwInSource = fs.readFileSync(MAIN_PY, 'utf8').match(/^FIRMWARE_VERSION = '([^']+)'/m)[1];
+    assert.strictEqual(answer.result.fw, fwInSource);
+    assert.strictEqual(answer.result.hash, firmwareHash(PICO_SRC));
+    assert.strictEqual(answer.result.uart, '19200 8N1');
+    assert.strictEqual(answer.result.connections, 1);
+    assert.strictEqual(answer.result.uart_rx_bytes, 17);
+    assert.ok(answer.result.uptime_s >= 0);
+    assert.strictEqual(b.uartTx().length, 0, 'a control command is never written to the serial device');
+    assert.strictEqual(b.state.data.length, 1, 'and its answer is never delivered as device data');
+});
+
+test('uart set retunes the link for this session only; --save is what makes it survive', { skip }, async (t) => {
+    const b = await bench(t);
+    await waitFor(() => b.state.session && b.state.session.registered, 'registration');
+    assert.ok(b.seen(/^UART-INIT 19200 8 N 1$/), 'boots at 19200 8N1');
+
+    let answer = await b.state.session.control('uart_set', { baud: 9600, parity: 'E', save: false });
+    assert.deepStrictEqual(answer, { ok: true, result: { uart: '9600 8E1', saved: false } });
+    await waitFor(() => b.seen(/^UART-INIT 9600 8 E 1$/), 'the UART to be re-initialised');
+    assert.strictEqual(boardConfig(b).UART, undefined, 'nothing written to flash: a power cycle undoes a wrong setting');
+    assert.strictEqual((await b.state.session.control('status')).result.uart, '9600 8E1');
+
+    // The relay keeps working at the new settings.
+    b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    await waitFor(() => b.uartTx().length === 1, 'UART-TX after the retune');
+
+    answer = await b.state.session.control('uart_set', { baud: 1 });
+    assert.strictEqual(answer.ok, false);
+    assert.match(answer.error, /baud must be between/);
+    assert.ok(!b.seen(/^UART-INIT 1 /), 'a refused setting is never applied');
+
+    answer = await b.state.session.control('uart_set', { baud: 4800, save: true });
+    assert.deepStrictEqual(answer.result, { uart: '4800 8E1', saved: true });
+    const saved = boardConfig(b);
+    assert.deepStrictEqual(saved.UART, { baud: 4800, bits: 8, parity: 0, stop: 1 });
+    assert.strictEqual(saved.KEY, KEY.toString('hex'), 'saving the serial settings keeps the device key');
+    assert.strictEqual(saved.WIFI_SSID, 'sim');
+});
+
+test('identify blinks for the time asked and then stops, without interrupting the relay', { skip }, async (t) => {
+    const b = await bench(t);
+    await waitFor(() => b.state.session && b.state.session.registered, 'registration');
+    const answer = await b.state.session.control('identify', { seconds: 1 });
+    assert.deepStrictEqual(answer, { ok: true, result: { blinking_for: 1 } });
+    b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    await waitFor(() => b.uartTx().length === 1, 'the relay to carry on while blinking');
+    await waitFor(() => b.seen(/\[CTL\] identify finished/), 'the blinking to stop by itself', 5000);
+});
+
+test('reboot answers, then resets the board', { skip }, async (t) => {
+    const b = await bench(t);
+    await waitFor(() => b.state.session && b.state.session.registered, 'registration');
+    const answer = await b.state.session.control('reboot');
+    assert.deepStrictEqual(answer, { ok: true, result: { rebooting: true } });
+    await waitFor(() => b.state.exitCode !== null, 'the board to reset');
+    assert.ok(b.seen(/^MACHINE-RESET$/), b.state.stdout.join('\n'));
+    assert.strictEqual(b.uartTx().length, 0);
+});
+
+test('an unknown control command is refused by the board and changes nothing', { skip }, async (t) => {
+    const b = await bench(t);
+    await waitFor(() => b.state.session && b.state.session.registered, 'registration');
+    const answer = await b.state.session.control('format_flash');
+    assert.deepStrictEqual(answer, { ok: false, error: 'unknown command: format_flash' });
+    assert.strictEqual(b.state.exitCode, null);
+});

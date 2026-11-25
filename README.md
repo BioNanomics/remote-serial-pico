@@ -80,6 +80,29 @@ remote-serial-pico status    # is it up, which Picos are connected, on what firm
 `doctor` exits non-zero if anything is wrong, so it can gate a script. Log out
 and back in once after the first install so your new group membership applies.
 
+### Controlling a board without walking to it
+
+```bash
+remote-serial-pico ctl Blinds_pico status              # firmware, uptime, WiFi signal, serial counters
+remote-serial-pico ctl Blinds_pico identify 30         # blink its LED for 30 s so you can find it
+remote-serial-pico ctl Blinds_pico reboot
+remote-serial-pico ctl Blinds_pico uart set 9600       # retune the serial link: baud [bits parity stop]
+remote-serial-pico ctl Blinds_pico uart set 9600 8 N 1 --save
+remote-serial-pico ctl Blinds_pico listen              # watch the serial traffic in hex, Ctrl-C to stop
+```
+
+The name is the port name shown by `remote-serial-pico status`. These commands
+travel on their own channel: nothing they send or receive ever shows up in the
+serial port, and a board only obeys them from the Pi it was provisioned on.
+
+`uart set` lasts **until the board restarts** unless you add `--save`. That is
+deliberate: if you set a baud rate that does not match the device, power-cycle
+the board and it is back to what it had. With `--save` the setting is kept
+across restarts, so check it works first.
+
+Anyone who may open the ports (members of the `rspico` group) may use `ctl`.
+Every command and its result is written to the server log.
+
 ### Where everything lives
 
 Everything is under one install root, `/opt/remote-serial-pico` by default.
@@ -96,6 +119,7 @@ Everything is under one install root, `/opt/remote-serial-pico` by default.
     pico_serial_map.yaml        serial id -> port name          (back this up)
     pico_secrets.yaml           per-device keys, mode 0600      (back this up)
     state.json                  what `status` reads
+    control.sock                where `ctl` reaches the server
     ptyserver.log               every command and response
   ports/                        owned by the service user: <name> -> /dev/pts/N
 ```
@@ -125,6 +149,7 @@ service after editing it: `sudo systemctl restart ptyserver.service`.
 | `PicoSerialMap` | Where the serial-ID → friendly-name map is stored |
 | `PicoSecrets` | Per-device key store, mode `0600`. Written by the deployer each time a board is plugged in |
 | `StateFile` | Last known firmware and connection state of each board, for `status` |
+| `ControlSocket` | Where `remote-serial-pico ctl` reaches the server |
 | `symlinkDir` | Where the port symlinks are created |
 | `FirmwareDir` | MicroPython image cache and the auto-flash kill switch |
 | `DeployerLog` | Log of the provisioning scripts |

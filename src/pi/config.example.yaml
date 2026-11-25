@@ -21,6 +21,10 @@ PicoSecrets: '@ROOT@/data/pico_secrets.yaml'
 StateFile: '@ROOT@/data/state.json'
 # Where the serial ports appear: <symlinkDir>/<name> -> /dev/pts/N
 symlinkDir: '@ROOT@/ports'
+# Where `remote-serial-pico ctl <name> ...` reaches the server. Created by the
+# server, mode 0660 for the service's group: whoever may open a board's port
+# may also control the board.
+ControlSocket: '@ROOT@/data/control.sock'
 
 # --- root-owned: udev runs code as root against these -------------------------
 # MicroPython UF2 cache, and the auto-flash kill switch (autoflash-enabled).

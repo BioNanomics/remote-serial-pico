@@ -1,4 +1,6 @@
+import gc
 import network
+import os
 import socket
 import select
 import time
@@ -6,6 +8,7 @@ import json
 import machine
 from machine import UART, Pin, WDT
 import auth
+import control
 from net_util import (safe_decode, send_all, firmware_hash, Backoff,
                       HeartbeatMonitor, PicoLink, RegistrationRefused)
 
@@ -14,7 +17,7 @@ from net_util import (safe_decode, send_all, firmware_hash, Backoff,
 # `remote-serial-pico status` and the logs can say which firmware each board
 # runs without anyone walking over to it. Bump on every change that ships to
 # a board.
-FIRMWARE_VERSION = '1.1.0'
+FIRMWARE_VERSION = '1.2.0'
 FIRMWARE_HASH = firmware_hash()
 
 # Load network configuration
@@ -37,10 +40,29 @@ if DEVICE_KEY is not None and len(DEVICE_KEY) != auth.KEY_LEN:
 if DEVICE_KEY is None:
     print("[MAIN] No device key in config.json; the Pi will refuse this board until it is provisioned")
 
-# Initialize UART and onboard LED
-uart1 = UART(1, 19200)
-uart1.init(19200, bits=8, parity=None, stop=1, tx=4, rx=5)
+# Initialize UART and onboard LED. The serial settings are 19200 8N1 unless a
+# `uart set ... --save` control command stored others in config.json; settings
+# changed without --save last only until the next reset, so a wrong baud rate
+# is undone by a power cycle (issue #19 Phase E).
+try:
+    UART_SETTINGS = control.uart_settings(None, config.get('UART'))
+except ValueError as e:
+    print(f"[UART] Ignoring bad UART settings in config.json ({e}); using the defaults")
+    UART_SETTINGS = control.uart_settings(None)
+
+uart1 = UART(1, UART_SETTINGS['baud'])
+
+def apply_uart(settings):
+    uart1.init(settings['baud'], bits=settings['bits'], parity=settings['parity'],
+               stop=settings['stop'], tx=4, rx=5)
+    print(f"[UART] Serial link is {control.describe_uart(settings)}")
+
+apply_uart(UART_SETTINGS)
 led = Pin("LED", Pin.OUT)
+
+# Counters for the `status` control command.
+BOOT_TIME = time.time()
+stats = {'connections': 0, 'uart_rx_bytes': 0, 'uart_tx_bytes': 0, 'uart_errors': 0}
 
 # Hardware watchdog: if the main loop ever stops calling wdt.feed() -- a true
 # hang that no try/except can catch, e.g. blocked forever inside a driver call
@@ -164,6 +186,52 @@ def create_tcp_connection():
             sleep_fed(delay)
             attempt += 1
 
+class Board:
+    """What control commands may do to this board (see control.ControlHandler)."""
+
+    def __init__(self):
+        self.reset_pending = False
+        self.identify_until = 0
+
+    def status(self):
+        try: rssi = wlan.status('rssi')
+        except Exception: rssi = None
+        try: free = gc.mem_free()
+        except Exception: free = None
+        return {
+            'fw': FIRMWARE_VERSION,
+            'hash': FIRMWARE_HASH,
+            'uptime_s': int(time.time() - BOOT_TIME),
+            'rssi': rssi,
+            'free_mem': free,
+            'connections': stats['connections'],
+            'uart_rx_bytes': stats['uart_rx_bytes'],
+            'uart_tx_bytes': stats['uart_tx_bytes'],
+            'uart_errors': stats['uart_errors'],
+        }
+
+    def apply_uart(self, settings):
+        apply_uart(settings)
+
+    def save_uart(self, settings):
+        # Rewrite config.json beside itself and rename, so a power cut in the
+        # middle cannot leave the board without its WiFi password and key.
+        saved = read_config()
+        saved['UART'] = settings
+        with open('config.json.tmp', 'w') as f:
+            json.dump(saved, f)
+        os.rename('config.json.tmp', 'config.json')
+        print("[UART] Settings saved to config.json")
+
+    def identify(self, seconds):
+        self.identify_until = time.time() + seconds
+
+    def reset_soon(self):
+        self.reset_pending = True
+
+board = Board()
+controller = control.ControlHandler(board, UART_SETTINGS)
+
 def tcp_send(sock, data):
     """Send all of data. Fed first, so a full SOCKET_TIMEOUT stall in here can
     never combine with another wait in the same pass to outlast the watchdog."""
@@ -174,8 +242,20 @@ def handle_server_event(sock, heartbeat, kind, value):
     """Act on one event from PicoLink.receive(). Only 'data' touches the UART."""
     if kind == 'data':
         uart1.write(value)
+        stats['uart_tx_bytes'] += len(value)
         print(f"[UART] Sent to UART: {safe_decode(value)!r}")
         blink_led()
+    elif kind == 'control':
+        # An authenticated command from the Pi. It is acted on here and
+        # answered on the socket; nothing about it is written to the UART.
+        request_id, cmd, args = value
+        ok, result = controller.handle(cmd, args)
+        print(f"[CTL] {cmd} {args if args else ''} -> {'ok' if ok else 'FAILED'} {result}")
+        tcp_send(sock, link.control_response(request_id, ok, result))
+        if board.reset_pending:
+            print("[CTL] Rebooting on request")
+            time.sleep(0.3)   # let the reply leave the socket
+            machine.reset()
     elif kind == 'pong':
         heartbeat.pong()
         print("[TCP] Heartbeat response: PONG")
@@ -204,6 +284,8 @@ while True:
     poller = select.poll()
     poller.register(s, select.POLLIN)
     link = PicoLink(PICO_ID, FIRMWARE_VERSION, FIRMWARE_HASH, DEVICE_KEY)
+    stats['connections'] += 1
+    identify_tick = 0
     heartbeat = HeartbeatMonitor(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
                                  HEARTBEAT_MAX_MISSES, now=time.time())
     extra_delay = 0
@@ -230,8 +312,10 @@ while True:
                     raw = uart1.read()
                 except Exception as e:
                     print(f"[UART] Read error: {e}")
+                    stats['uart_errors'] += 1
                     raw = None
                 if raw:
+                    stats['uart_rx_bytes'] += len(raw)
                     print(f"[UART] Received: {safe_decode(raw)!r}")
                     for chunk in link.data_frames(raw):
                         tcp_send(s, chunk)
@@ -258,6 +342,19 @@ while True:
                     raise OSError('socket reported hangup/error')
 
             now = time.time()
+
+            # `identify`: blink so someone can find this board in a ceiling.
+            # A few toggles a second, without ever blocking the relay.
+            if board.identify_until:
+                if now >= board.identify_until:
+                    board.identify_until = 0
+                    led.on()
+                    print("[CTL] identify finished")
+                else:
+                    identify_tick += 1
+                    if identify_tick % 4 == 0:
+                        led.value(not led.value())
+
             if not link.registered and now > register_deadline:
                 raise OSError(f'no REGISTER_ACK within {REGISTER_TIMEOUT} s')
 

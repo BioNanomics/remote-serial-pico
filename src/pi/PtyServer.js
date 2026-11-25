@@ -4,6 +4,7 @@ const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
 const { PicoSession } = require('./session.js');
+const { ControlServer } = require('./control.js');
 const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup, firmwareHash, SecretStore } = require('./runtime.js');
 
 const { createLogger, format, transports } = require('winston');
@@ -225,6 +226,7 @@ function routePtyCmdToSocket(picoName) {
         }
         const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data, 'binary');
         device.session.sendData(bytes);
+        if (control) control.tap(picoName, 'to-device', bytes);
         logger.info(`command to ${picoName}: ${JSON.stringify(bytes.toString('latin1'))}`);
     });
 }
@@ -234,8 +236,25 @@ function writePicoRespToPty(picoName, payload) {
     const myPty = picoDevices[picoName] && picoDevices[picoName].pty;
     if (myPty) {
         myPty.write(payload.toString('latin1'));
+        if (control) control.tap(picoName, 'from-device', payload);
         logger.info(`Response from ${picoName}: ${JSON.stringify(payload.toString('latin1'))}`);
     }
+}
+
+// The control channel's operator side: `remote-serial-pico ctl <name> ...`
+// connects to this socket (control.js). Control commands travel to the board
+// as their own opcodes and never through the pty.
+let control = null;
+if (config.ControlSocket) {
+    control = new ControlServer({
+        socketPath: config.ControlSocket,
+        sessionFor: (name) => (picoDevices[name] && picoDevices[name].session) || null,
+        names: () => Object.keys(picoDevices).filter((name) => picoDevices[name].session && picoDevices[name].session.registered),
+        log: (level, msg) => logger[level](msg),
+    });
+    control.start();
+} else {
+    logger.warn('No ControlSocket in config.yaml: `remote-serial-pico ctl` is unavailable');
 }
 
 // A Pico connection speaks wire protocol v1 (docs/protocol.md) and must
@@ -281,6 +300,7 @@ function onPicoSocket(socket) {
 
     socket.on('close', () => {
         clearTimeout(handshakeTimer);
+        session.connectionLost();
         if (picoName) {
             logger.warn(`${picoName} socket close event triggered; ignored this event`);
             if (picoDevices[picoName] && picoDevices[picoName].session === session) {
@@ -363,6 +383,7 @@ function fullCleanUp() {
         cleanPicoResources(picoName);
     });
     state.allDisconnected();
+    if (control) control.stop();
     process.exit(0);
 }
 

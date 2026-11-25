@@ -274,7 +274,11 @@ class TestFirmwareHash(unittest.TestCase):
         self.assertRegex(base, r'^[0-9a-f]{16}$')
         with open(os.path.join(self.SRC, 'firmware.json')) as fh:
             names = ['firmware.json'] + json.load(fh)['files']
-        self.assertEqual(names, ['firmware.json', 'main.py', 'net_util.py', 'frame.py', 'auth.py'])
+        # Every module the board runs must be listed, or a change to it would
+        # be invisible. Checked against the directory, so a new file cannot be
+        # forgotten.
+        on_disk = sorted(n for n in os.listdir(self.SRC) if n.endswith('.py') and not n.startswith('test_'))
+        self.assertEqual(sorted(names[1:]), on_disk)
         for changed in names:
             with tempfile.TemporaryDirectory() as d:
                 for name in names:
@@ -521,8 +525,57 @@ class TestPicoLink(unittest.TestCase):
 
     def test_later_phase_opcodes_are_ignored_without_an_error(self):
         link = self.link(registered=True)
-        for op in (F.OP_CONTROL_REQUEST, F.OP_UPDATE_OFFER):
+        for op in (F.OP_UPDATE_OFFER,):
             self.assertEqual(link.receive(self.pi.sealed(op, b'\x00')), [('ignored', op)], hex(op))
+
+    # --- control channel (Phase E) ---------------------------------------------
+
+    def control(self, body):
+        return self.pi.sealed(F.OP_CONTROL_REQUEST, json.dumps(body).encode())
+
+    def test_an_authenticated_control_request_is_handed_to_main_not_to_the_uart(self):
+        link = self.link(registered=True)
+        events = link.receive(self.control({'id': 7, 'cmd': 'uart_set', 'args': {'baud': 9600}}))
+        self.assertEqual(events, [('control', (7, 'uart_set', {'baud': 9600}))])
+        self.assertFalse(any(k == 'data' for k, _ in events), 'a control command must never look like device data')
+
+    def test_control_response_carries_the_id_and_either_a_result_or_an_error(self):
+        link = self.link(registered=True)
+        op, body = self.pi.opened(link.control_response(7, True, {'uart': '9600 8N1'}))
+        self.assertEqual(op, F.OP_CONTROL_RESPONSE)
+        self.assertEqual(json.loads(body), {'id': 7, 'ok': True, 'result': {'uart': '9600 8N1'}})
+        op, body = self.pi.opened(link.control_response(8, False, 'baud must be between 300 and 921600'))
+        self.assertEqual(json.loads(body), {'id': 8, 'ok': False, 'error': 'baud must be between 300 and 921600'})
+
+    def test_every_control_command_must_be_authenticated(self):
+        # An unauthenticated `reboot` would be a one-packet building-wide outage.
+        reboot = json.dumps({'id': 1, 'cmd': 'reboot', 'args': {}}).encode()
+        link = self.link(registered=True)
+        self.assertEqual(link.receive(F.encode(F.OP_CONTROL_REQUEST, 9, reboot)), [('close', 'frame failed authentication')])
+        link = self.link(registered=True)
+        self.assertEqual(link.receive(F.encode(F.OP_CONTROL_REQUEST, 9, reboot + b'\x00' * 16)),
+                         [('close', 'frame failed authentication')])
+        # Before registration there is no session at all to carry one.
+        link = self.link()
+        self.assertFalse(any(k == 'control' for k, _ in link.receive(F.encode(F.OP_CONTROL_REQUEST, 0, reboot))))
+        link.receive(self.pi.challenge())
+        self.assertFalse(any(k == 'control' for k, _ in link.receive(self.control({'id': 1, 'cmd': 'reboot'}))),
+                         'not even a correctly tagged command is run before REGISTER_ACK')
+
+    def test_a_replayed_control_command_is_rejected(self):
+        link = self.link(registered=True)
+        frame_bytes = self.control({'id': 1, 'cmd': 'reboot'})
+        self.assertEqual(link.receive(frame_bytes)[0][0], 'control')
+        self.assertEqual(link.receive(frame_bytes), [('close', 'frame failed authentication')])
+
+    def test_a_malformed_control_request_gets_an_error_reply_and_runs_nothing(self):
+        for body in (b'not json', b'[]', b'{"id": 3}', b'{"id": 3, "cmd": 5}'):
+            link = self.link(registered=True)
+            events = link.receive(self.pi.sealed(F.OP_CONTROL_REQUEST, body))
+            self.assertEqual([k for k, _ in events], ['send'], body)
+            op, reply = self.pi.opened(events[0][1])
+            self.assertEqual(op, F.OP_CONTROL_RESPONSE)
+            self.assertFalse(json.loads(reply)['ok'])
 
     def test_unknown_opcode_gets_error_2(self):
         link = self.link(registered=True)

@@ -272,6 +272,70 @@ fi
 relay "after the refused attempts"
 
 # ---------------------------------------------------------------------------
+step "control channel (Phase E): remote-serial-pico ctl against the real firmware"
+# The real src/pico/main.py, run by tools/pico_sim with stand-ins for the
+# hardware, connected to the installed service like a board would be.
+SIM_ID=5151515151515151
+SIM_KEY=$(openssl rand -hex 32)
+in_root sh -c "printf \"%s: '%s'\\n\" '$SIM_ID' '$SIM_KEY' >> '$RSP_ROOT/data/pico_secrets.yaml'"
+start_sim() {   # the stub exits when its stdin closes, so keep one open
+    docker exec -d -u pi "$NAME" sh -c "tail -f /dev/null | python3 -u '$RSP_ROOT/app/tools/pico_sim/run_main.py' \
+        --host '$BIND_IP' --port '$PORT' --id '$SIM_ID' --key '$SIM_KEY' >> /tmp/sim.log 2>&1"
+}
+sim_log() { in_root cat /tmp/sim.log 2>/dev/null; }
+wait_sim() {   # wait_sim "regex in the board's own output"
+    for _ in $(seq 1 60); do sim_log | grep -Eq "$1" && return 0; sleep 0.25; done; return 1
+}
+ctl() { as_pi remote-serial-pico ctl "$@"; }
+
+start_sim
+expect_ok "the simulated board registers with the installed service" wait_sim "Registered as '$SIM_ID'"
+
+# Anything a control command leaks into the serial port would show up here.
+docker exec -d -u pi "$NAME" sh -c "timeout 6 cat '$RSP_ROOT/ports/$SIM_ID' > /tmp/pty-during-ctl.bin 2>/dev/null"
+
+out=$(ctl "$SIM_ID" status 2>&1); code=$?
+echo "$out"
+expect_ok "ctl status: answers with the board's firmware and serial settings" \
+    sh -c 'test "$1" -eq 0 && echo "$2" | grep -q "^firmware " && echo "$2" | grep -q "^serial link  *19200 8N1"' sh "$code" "$out"
+
+out=$(ctl "$SIM_ID" identify 1 2>&1); code=$?
+echo "$out"
+expect_ok "ctl identify: accepted" test $code -eq 0
+expect_ok "ctl identify: the board blinked and stopped by itself" wait_sim "\[CTL\] identify finished"
+
+out=$(ctl "$SIM_ID" uart set 9600 8 e 1 2>&1); code=$?
+echo "$out"
+expect_ok "ctl uart set: accepted, not saved" sh -c 'test "$1" -eq 0 && echo "$2" | grep -q "\"saved\":false"' sh "$code" "$out"
+expect_ok "ctl uart set: the board retuned its serial link" wait_sim "^UART-INIT 9600 8 E 1"
+out=$(ctl "$SIM_ID" uart set 5 2>&1); code=$?
+echo "$out"
+expect_ok "ctl uart set: a nonsense baud rate is refused by the board and exits non-zero" \
+    sh -c 'test "$1" -ne 0 && echo "$2" | grep -q "baud must be between"' sh "$code" "$out"
+
+out=$(ctl no-such-board reboot 2>&1); code=$?
+echo "$out"
+expect_ok "ctl: a board that is not connected is an error" sh -c 'test "$1" -ne 0 && echo "$2" | grep -q "is not connected"' sh "$code" "$out"
+
+sleep 6   # let the pty capture above run out
+leaked=$(in_root sh -c 'wc -c < /tmp/pty-during-ctl.bin' 2>/dev/null | tr -d ' ')
+expect_ok "no control command or answer appeared in the pty stream" test "${leaked:-1}" = 0
+
+out=$(ctl "$SIM_ID" reboot 2>&1); code=$?
+echo "$out"
+expect_ok "ctl reboot: accepted" test $code -eq 0
+expect_ok "ctl reboot: the board reset" wait_sim "^MACHINE-RESET"
+expect_ok "every control command and its result is in the server log" \
+    sh -c "docker exec '$NAME' grep -c 'control: ' '$RSP_ROOT/data/ptyserver.log' | awk '{exit !(\$1 >= 6)}'"
+expect_ok "the control socket is for the service group only" \
+    test "$(in_root stat -c '%a %U %G' "$RSP_ROOT/data/control.sock")" = "660 $SVC_USER $SVC_USER"
+# A user outside the service group cannot control a board.
+in_root useradd -m outsider 2>/dev/null
+out=$(docker exec -u outsider "$NAME" remote-serial-pico ctl "$SIM_ID" status 2>&1); code=$?
+echo "$out"
+expect_ok "someone outside the service group cannot use ctl" test $code -ne 0
+
+# ---------------------------------------------------------------------------
 step "the provisioning scripts take everything from config.yaml"
 # No Pico here, so stand in for rshell and for the WiFi lookup: what matters is
 # the port and address the deployer would write to a board, and that the WiFi
@@ -308,7 +372,8 @@ expect_ok "deployer puts the WiFi password on the board" grep -q 'password-deliv
 leak=$(in_root grep -rl -- "$WIFI_PW" "$RSP_ROOT" /tmp /run /var/tmp 2>/dev/null)
 if [ -z "$leak" ]; then pass "the WiFi password is left nowhere on disk"; else fail "WiFi password left in: $leak"; fi
 expect_ok "deployer logged to the root-owned log" in_root grep -q 'pico_id=e661abcd00000000' "$RSP_ROOT/log/deployer.log"
-expect_ok "deployer copies every firmware file the manifest names" grep -q '^files firmware.json main.py net_util.py frame.py auth.py config.json$' <<<"$out"
+WANT_FILES="firmware.json $(in_root python3 -c "import json,sys; print(' '.join(json.load(open(sys.argv[1]))['files']))" "$RSP_ROOT/app/src/pico/firmware.json") config.json"
+expect_ok "deployer copies every firmware file the manifest names" grep -qx "files $WANT_FILES" <<<"$out"
 
 # Phase D: the deployer gave that board a key and recorded it for the server.
 BOARD_KEY=$(sed -n 's/.*"KEY": "\([0-9a-f]\{64\}\)".*/\1/p' <<<"$out")

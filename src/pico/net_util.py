@@ -198,6 +198,8 @@ class PicoLink:
       ('pong', None)            the server answered our PING
       ('send', bytes)           a protocol reply to put on the socket
       ('error', (code, msg))    the server reported an ERROR
+      ('control', (id, cmd, args))  an authenticated control command to run;
+                                answer with control_response()
       ('ignored', opcode)       a later-phase opcode this firmware skips
       ('close', reason)         give up on this connection
 
@@ -250,6 +252,16 @@ class PicoLink:
     def error_frame(self, code, msg):
         return self._json(frame.OP_ERROR, {'code': code, 'msg': msg})
 
+    def control_response(self, request_id, ok, result):
+        """The reply to one ('control', ...) event. `result` is the command's
+        result object when ok, otherwise the error message."""
+        body = {'id': request_id, 'ok': bool(ok)}
+        if ok:
+            body['result'] = result
+        else:
+            body['error'] = str(result)
+        return self._json(frame.OP_CONTROL_RESPONSE, body)
+
     def data_frames(self, data):
         """UART bytes as DATA frames, split so none exceeds MAX_PAYLOAD once
         its tag is added.
@@ -301,9 +313,18 @@ class PicoLink:
         elif op == frame.OP_ERROR:
             err = frame.decode_json(body) or {}
             events.append(('error', (err.get('code'), err.get('msg'))))
+        elif op == frame.OP_CONTROL_REQUEST:
+            # Reached only with a valid tag, so it is from the Pi that holds
+            # our key. It never goes near the UART: main.py runs it.
+            req = frame.decode_json(body)
+            if not isinstance(req, dict) or not isinstance(req.get('cmd'), str):
+                events.append(('send', self.control_response(
+                    req.get('id') if isinstance(req, dict) else None, False, 'malformed control request')))
+            else:
+                events.append(('control', (req.get('id'), req['cmd'], req.get('args'))))
         elif op in frame.KNOWN_OPCODES:
-            # Assigned to a later phase (control, update), or a handshake
-            # opcode out of place: nothing to do, and not an error.
+            # Assigned to a later phase (update), or a handshake opcode out
+            # of place: nothing to do, and not an error.
             events.append(('ignored', op))
         else:
             events.append(('send', self.error_frame(

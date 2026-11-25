@@ -653,6 +653,11 @@ test('install stops at a service that does not come up instead of reporting succ
 
 function doctorOn(d, answers = {}, extra = {}) {
     const { ctx } = fullInstall(d);
+    // The server creates the control socket when it starts; stand in for it.
+    const sockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-'));
+    const ctlSock = path.join(sockDir, 'c.sock');
+    require('node:child_process').spawnSync(process.execPath, ['-e', "require('net').createServer().listen(process.argv[1], () => { require('fs').chmodSync(process.argv[1], 0o660); process.exit(0); })", ctlSock]);
+    fs.writeFileSync(ctx.cfg.configPath, fs.readFileSync(ctx.cfg.configPath, 'utf8').replace(/^ControlSocket: .*$/m, `ControlSocket: '${ctlSock}'`));
     // /dev/log does not exist on every machine that runs these tests.
     const sock = path.join(d, 'dev-log'); fs.writeFileSync(sock, '');
     fs.writeFileSync(ctx.cfg.configPath, fs.readFileSync(ctx.cfg.configPath, 'utf8').replace("SyslogDir: '/dev/log'", `SyslogDir: '${sock}'`));
@@ -752,6 +757,21 @@ test('doctor loads node-pty under the node named in the unit, not the one runnin
     assert.match(ch.detail, /\/opt\/node20\/bin\/node: NODE_MODULE_VERSION 115/);
 });
 
+test('doctor flags a missing control socket, and one that is open to everyone', () => {
+    const d = tmp();
+    const { ctx } = doctorOn(d);
+    const sock = I.parseFlatYaml(fs.readFileSync(ctx.cfg.configPath, 'utf8')).ControlSocket;
+    assert.strictEqual(I.doctorChecks(ctx).find(c => c.name === 'control socket').ok, true);
+    fs.chmodSync(sock, 0o666);
+    let ch = I.doctorChecks(ctx).find(c => c.name === 'control socket');
+    assert.strictEqual(ch.ok, false);
+    assert.match(ch.detail, /open to everyone/);
+    fs.rmSync(sock);
+    ch = I.doctorChecks(ctx).find(c => c.name === 'control socket');
+    assert.strictEqual(ch.ok, false);
+    assert.match(ch.hint, /systemctl restart/);
+});
+
 test('doctor notices a udev rule that was edited or removed, and an app that is older than the package', () => {
     const d = tmp();
     const { ctx } = doctorOn(d);
@@ -827,5 +847,5 @@ test('dependencies are locked in the file npm actually ships, and node-pty is pi
 });
 
 test('usage names the three commands and the options', () => {
-    for (const w of ['install', 'doctor', 'status', '--root', '--firewall', '--firmware-from', I.DEFAULT_ROOT]) assert.ok(I.usage().includes(w), w);
+    for (const w of ['install', 'doctor', 'status', 'ctl <name>', 'uart set', '--root', '--firewall', '--firmware-from', I.DEFAULT_ROOT]) assert.ok(I.usage().includes(w), w);
 });

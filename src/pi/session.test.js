@@ -307,9 +307,61 @@ test('unknown opcode gets ERROR 2; known-but-unimplemented opcode is only logged
     assert.strictEqual(out.sent.at(-1).opcode, F.OPCODE.ERROR);
     assert.strictEqual(JSON.parse(pico.open(out.sent.at(-1))).code, F.ERR.UNKNOWN_OPCODE);
     const sentBefore = out.sent.length;
-    pico.send(F.OPCODE.CONTROL_RESPONSE, '{}');
+    pico.send(F.OPCODE.UPDATE_RESULT, '{}');
     assert.strictEqual(out.sent.length, sentBefore);
-    assert.match(out.log.at(-1), /CONTROL_RESPONSE.*does not act on/);
+    assert.match(out.log.at(-1), /UPDATE_RESULT.*does not act on/);
+});
+
+// --- control channel (Phase E) ------------------------------------------------------
+
+test('a control command goes out as a tagged CONTROL_REQUEST and resolves with the board\'s answer', async () => {
+    const { session, out, pico } = registered();
+    const pending = session.control('uart_set', { baud: 9600, save: false });
+    const req = out.sent.at(-1);
+    assert.strictEqual(req.opcode, F.OPCODE.CONTROL_REQUEST);
+    const body = JSON.parse(pico.open(req));
+    assert.deepStrictEqual(body, { id: 1, cmd: 'uart_set', args: { baud: 9600, save: false } });
+    pico.send(F.OPCODE.CONTROL_RESPONSE, JSON.stringify({ id: 1, ok: true, result: { uart: '9600 8N1', saved: false } }));
+    assert.deepStrictEqual(await pending, { ok: true, result: { uart: '9600 8N1', saved: false } });
+});
+
+test('control traffic never appears in the pty stream, in either direction', async () => {
+    const { session, out, pico } = registered();
+    const pending = session.control('status');
+    pico.send(F.OPCODE.CONTROL_RESPONSE, JSON.stringify({ id: 1, ok: true, result: { fw: '#255.19.255.B=UP' } }));
+    await pending;
+    assert.deepStrictEqual(out.pty, [], 'a response is not device data');
+    assert.ok(out.sent.every(f => f.opcode !== F.OPCODE.DATA), 'a request is not sent as device data');
+});
+
+test('answers are matched to requests by id; a failure carries the board\'s reason', async () => {
+    const { session, pico } = registered();
+    const a = session.control('status'), b = session.control('uart_set', { baud: 1 });
+    pico.send(F.OPCODE.CONTROL_RESPONSE, JSON.stringify({ id: 2, ok: false, error: 'baud must be between 300 and 921600' }));
+    pico.send(F.OPCODE.CONTROL_RESPONSE, JSON.stringify({ id: 1, ok: true, result: { fw: '1.2.0' } }));
+    assert.deepStrictEqual(await a, { ok: true, result: { fw: '1.2.0' } });
+    assert.deepStrictEqual(await b, { ok: false, error: 'baud must be between 300 and 921600' });
+});
+
+test('a board that never answers, or drops, fails the command instead of hanging it', async () => {
+    let r = registered();
+    assert.deepStrictEqual(await r.session.control('status', {}, 20), { ok: false, error: 'no answer from the board within 0.02 s' });
+    r = registered();
+    const pending = r.session.control('reboot');
+    r.session.connectionLost();
+    assert.deepStrictEqual(await pending, { ok: false, error: 'the board disconnected before answering' });
+    const { session } = harness();
+    assert.deepStrictEqual(await session.control('reboot'), { ok: false, error: 'board is not connected' });
+});
+
+test('a control response nobody asked for, or a forged one, resolves nothing', async () => {
+    const { session, out, pico } = registered();
+    pico.send(F.OPCODE.CONTROL_RESPONSE, JSON.stringify({ id: 99, ok: true, result: {} }));
+    assert.match(out.log.at(-1), /CONTROL_RESPONSE nobody is waiting for/);
+    const pending = session.control('status', {}, 30);
+    pico.raw(F.OPCODE.CONTROL_RESPONSE, Buffer.from(JSON.stringify({ id: 1, ok: true, result: { fw: 'forged' } })));
+    assert.strictEqual(out.closed, true, 'an untagged response ends the connection');
+    assert.strictEqual((await pending).ok, false);
 });
 
 test('ERROR from the board is logged, not echoed', () => {
