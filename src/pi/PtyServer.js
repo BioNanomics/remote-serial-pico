@@ -5,7 +5,7 @@ const yaml = require('js-yaml');
 const path = require('path');
 const { PicoSession } = require('./session.js');
 const { ControlServer } = require('./control.js');
-const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup, firmwareHash, SecretStore } = require('./runtime.js');
+const { configPathFrom, resolveBindAddress, StateFile, readState, sharePtyWithGroup, firmwareHash, firmwareBundle, SecretStore } = require('./runtime.js');
 
 const { createLogger, format, transports } = require('winston');
 const { combine, timestamp, printf } = format;
@@ -82,10 +82,72 @@ secrets.onError = (err) => logger.error(`Could not read the key store ${config.P
 // hash. FirmwareMismatch in config.yaml: 'refuse' (the default) turns away a
 // board running anything else until it is plugged in again; 'warn' serves it
 // and logs.
-const canonicalFirmware = firmwareHash(path.join(__dirname, '..', 'pico'));
+const picoSourceDir = path.join(__dirname, '..', 'pico');
+const canonicalFirmware = firmwareHash(picoSourceDir);
 const firmwareMismatch = config.FirmwareMismatch === 'warn' ? 'warn' : 'refuse';
 state.expectedHash = canonicalFirmware;
 logger.info(`Firmware this Pi deploys has hash ${canonicalFirmware}; a board reporting another is ${firmwareMismatch === 'warn' ? 'served with a warning' : 'refused'}`);
+
+// Firmware updates over the air (issue #19 Phase F). Off unless FirmwareUpdate
+// is true in config.yaml; `remote-serial-pico ctl <name> update` allows one
+// board once regardless, which is how a single canary is done first. A board
+// is only ever updated at registration, before any serial data moves, and
+// only one board at a time: the others are told to come back (they retry
+// after 30 s), so a bad image cannot take the building down at once.
+const firmwareUpdate = config.FirmwareUpdate === true;
+const MAX_UPDATE_ATTEMPTS = 2;        // per board, per server run: no update loops
+let updateInProgress = null;          // serial id of the board being updated now
+const updateAttempts = new Map();     // serial id -> times offered
+const updateOnce = new Set();         // serial ids an operator asked to update
+const justUpdated = new Map();        // serial id -> hash it had before
+logger.info(`Firmware updates over the air are ${firmwareUpdate ? 'ON for every board, one at a time' : 'off (ctl <name> update allows one board)'}`);
+
+function offerUpdate(serialId, info) {
+    if (!firmwareUpdate && !updateOnce.has(serialId)) return null;
+    if (updateInProgress) {
+        logger.info(`firmware update: ${serialId} needs one, but ${updateInProgress} is being updated; one board at a time`);
+        return null;
+    }
+    const attempts = updateAttempts.get(serialId) || 0;
+    if (attempts >= MAX_UPDATE_ATTEMPTS) {
+        logger.error(`firmware update: ${serialId} was sent the update ${attempts} times and still reports hash ${info.hash}; not trying again until the server restarts`);
+        return null;
+    }
+    const bundle = firmwareBundle(picoSourceDir);
+    if (!bundle) {
+        logger.error(`firmware update: the firmware in ${picoSourceDir} is incomplete; nothing sent`);
+        return null;
+    }
+    updateAttempts.set(serialId, attempts + 1);
+    updateOnce.delete(serialId);
+    updateInProgress = serialId;
+    return bundle;
+}
+
+function updateFinished(serialId, ok, detail) {
+    if (updateInProgress === serialId) updateInProgress = null;
+    if (ok) justUpdated.set(serialId, detail.from);
+}
+
+// `ctl <name> update`: let this one board be updated, and make it reconnect
+// so that happens now rather than at its next reconnect.
+function requestUpdate(name) {
+    loadPicoMappingFromFile();
+    const serialId = Object.keys(serialIdToPicoName).find((id) => String(serialIdToPicoName[id]) === name);
+    if (!serialId) return { ok: false, error: `${name} is not a known board` };
+    const device = picoDevices[name];
+    const session = device && device.session;
+    if (session && session.registered && session.info.hash === canonicalFirmware) {
+        return { ok: false, error: `${name} already runs the firmware this Pi deploys (hash ${canonicalFirmware})` };
+    }
+    updateOnce.add(serialId);
+    updateAttempts.delete(serialId);
+    if (session && session.registered) {
+        session.close();
+        return { ok: true, result: { update: 'starting', note: `${name} is reconnecting and will be updated before it is served again` } };
+    }
+    return { ok: true, result: { update: 'armed', note: `${name} is not connected; it will be updated the next time it connects` } };
+}
 
 // Keep each board's last known firmware across a restart, but nothing is
 // connected to a server that has only just started.
@@ -250,6 +312,7 @@ if (config.ControlSocket) {
         socketPath: config.ControlSocket,
         sessionFor: (name) => (picoDevices[name] && picoDevices[name].session) || null,
         names: () => Object.keys(picoDevices).filter((name) => picoDevices[name].session && picoDevices[name].session.registered),
+        requestUpdate,
         log: (level, msg) => logger[level](msg),
     });
     control.start();
@@ -274,12 +337,19 @@ function onPicoSocket(socket) {
         close: () => socket.end(),
         log: (level, msg) => logger[level](msg),
         secretFor: (serialId) => secrets.get(serialId),
+        offerUpdate,
+        updateFinished,
         // Only called once the board has authenticated, so an unknown or
         // impersonated serial id never gets a pty or a line in the serial map.
         register: (serialId, info) => {
             picoName = handlePicoConnection(serialId, socket);
             picoDevices[picoName].session = session;
             picoDevices[picoName].firmware = info;   // { fw, hash } for status/logs
+            if (justUpdated.has(serialId)) {
+                logger.info(`firmware update complete: ${picoName} was hash ${justUpdated.get(serialId)}, now runs ${info.fw} (hash ${info.hash})`);
+                justUpdated.delete(serialId);
+            }
+            if (info.hash === canonicalFirmware) updateAttempts.delete(serialId);
             state.connected(picoName, { serial: serialId, fw: info && info.fw, hash: info && info.hash, protocol: session.protocol, peer });
             return picoName;
         },

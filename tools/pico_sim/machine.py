@@ -89,8 +89,13 @@ class UART:
         return len(data)
 
 
+wdt_armed = False     # run_main.py asks: would a crashed main.py have been reset?
+
+
 class WDT:
     def __init__(self, timeout=8388):
+        global wdt_armed
+        wdt_armed = True
         self.timeout = timeout / 1000.0
         self._last = time.monotonic()
         self.max_gap = 0.0

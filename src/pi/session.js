@@ -14,6 +14,8 @@ const F = require('./frame.js');
 const A = require('./auth.js');
 
 const SERIAL_ID = /^[0-9a-f]{16}$/;
+const UPDATE_CHUNK_BYTES = 512;       // data per UPDATE_CHUNK; small enough for a Pico to write between watchdog feeds
+const UPDATE_TIMEOUT_MS = 90000;      // offer to UPDATE_RESULT
 
 // Board-supplied text goes into log lines. Keep it printable and short so a
 // board cannot forge a line of log (issue #19 review, S7).
@@ -31,6 +33,12 @@ class PicoSession {
     //   register(id, info) -> name called once, after the board authenticated;
     //                              returns its display name. info = { fw, hash }
     //   onData(buf)                a DATA payload from the board, for the pty
+    //   offerUpdate(id, info) -> bundle | null   optional. Called when an
+    //                              authenticated board's firmware differs from
+    //                              this Pi's. Return runtime.firmwareBundle()
+    //                              to update the board now, null to leave it
+    //   updateFinished(id, ok, detail)  optional. The update ended: accepted
+    //                              by the board (detail = { from, to }), or not
     //   now() -> seconds           optional, for REGISTER_ACK.time
     //   randomBytes(n) -> Buffer   optional, for the challenge nonce
     // options:
@@ -50,6 +58,8 @@ class PicoSession {
         this.pending = null;       // { key, nonce } between AUTH_CHALLENGE and AUTH_RESPONSE
         this.tx = null;            // A.Tagger, pi -> pico, once authenticated
         this.rx = null;            // A.Tagger, pico -> pi
+        this.updating = null;      // { from, to, timer } while a firmware update is in flight
+        this.updateTimeoutMs = options.updateTimeoutMs || UPDATE_TIMEOUT_MS;
         this.requests = new Map(); // control request id -> { resolve, timer, cmd }
         this.nextRequestId = 1;
         this.closed = false;
@@ -131,13 +141,70 @@ class PicoSession {
     // The socket is gone (PtyServer calls this from its close handler too).
     connectionLost() {
         this.failRequests('the board disconnected before answering');
+        this.endUpdate(false, 'the connection was lost during the update');
     }
 
     close() {
         if (this.closed) return;
         this.closed = true;
         this.failRequests('the connection was closed before the board answered');
+        this.endUpdate(false, 'the connection was closed during the update');
         this.hooks.close();
+    }
+
+    // --- firmware update (Phase F) -----------------------------------------
+
+    // Send the whole firmware to a board that has authenticated but is not
+    // registered yet: no pty exists and no serial data has moved, so nothing
+    // is interrupted. Every frame carries the session tag, so the board only
+    // accepts it from the holder of its key.
+    startUpdate(bundle) {
+        const { id, fw, hash } = this.info;
+        const bytes = bundle.files.reduce((n, f) => n + f.data.length, 0);
+        this.updating = {
+            from: hash, to: bundle.hash,
+            timer: setTimeout(() => this.onUpdateFailed(`no answer from the board within ${this.updateTimeoutMs / 1000} s`), this.updateTimeoutMs),
+        };
+        this.updating.timer.unref();    // never the only thing keeping the server alive at shutdown
+        this.hooks.log('info', `firmware update: ${id} runs ${fw} (hash ${hash}); sending hash ${bundle.hash}, ${bundle.files.length} files, ${bytes} bytes, before it is registered`);
+        for (const file of bundle.files) {
+            this.sendJson(F.OPCODE.UPDATE_OFFER, { name: file.name, len: file.data.length, sha256: file.sha256 });
+            for (let offset = 0; offset < file.data.length; offset += UPDATE_CHUNK_BYTES) {
+                const head = Buffer.alloc(4);
+                head.writeUInt32BE(offset, 0);
+                this.sendFrame(F.OPCODE.UPDATE_CHUNK, Buffer.concat([head, file.data.subarray(offset, offset + UPDATE_CHUNK_BYTES)]));
+            }
+        }
+        this.sendJson(F.OPCODE.UPDATE_OFFER, { commit: true, hash: bundle.hash, files: bundle.files.map(f => f.name) });
+    }
+
+    endUpdate(ok, detail) {
+        if (!this.updating) return null;
+        const was = this.updating;
+        clearTimeout(was.timer);
+        this.updating = null;
+        if (this.hooks.updateFinished) this.hooks.updateFinished(this.info.id, ok, ok ? { from: was.from, to: was.to } : detail);
+        return was;
+    }
+
+    onUpdateResult(body) {
+        const res = F.decodeJson(body) || {};
+        const { id, fw } = this.info;
+        if (res.ok === true && res.hash === this.updating.to) {
+            const was = this.endUpdate(true);
+            this.hooks.log('info', `firmware update: ${id} verified and installed it: ${fw} (hash ${was.from}) -> hash ${was.to}. The board is restarting`);
+            return this.close();
+        }
+        this.onUpdateFailed(res.ok === true ? `the board reports hash ${printable(res.hash)}, not ${this.updating.to}` : printable(res.msg === undefined ? 'no reason given' : res.msg, 160));
+    }
+
+    // The board keeps the firmware it had. What happens to it now is the
+    // ordinary mismatch policy: refused, or served with a warning.
+    onUpdateFailed(reason) {
+        const was = this.endUpdate(false, reason);
+        if (!was || this.closed) return;
+        this.hooks.log('error', `firmware update: ${this.info.id} did NOT take the update (${reason}); it keeps running hash ${was.from}`);
+        this.applyMismatchPolicy();
     }
 
     refuse(reason, logLine) {
@@ -192,6 +259,7 @@ class PicoSession {
             this.close();
             return;
         }
+        if (frame.opcode === F.OPCODE.UPDATE_RESULT && this.updating) return this.onUpdateResult(body);
         switch (frame.opcode) {
             case F.OPCODE.PING: return this.onPing();
             case F.OPCODE.DATA: return this.onData(body);
@@ -250,13 +318,25 @@ class PicoSession {
         this.rx = new A.Tagger(keys.picoToPi);
 
         if (this.firmwareHash && hash !== this.firmwareHash) {
-            if (this.firmwareMismatch === 'refuse') {
-                return this.refuse('firmware mismatch',
-                    `refusing ${id}: it runs firmware ${fw} (hash ${hash}) but this Pi deploys hash ${this.firmwareHash}. Plug the board into this Pi to update it`);
-            }
-            this.hooks.log('warn', `${id} runs firmware ${fw} (hash ${hash}), not the hash ${this.firmwareHash} this Pi deploys`);
+            const bundle = this.hooks.offerUpdate ? this.hooks.offerUpdate(id, { fw, hash }) : null;
+            if (bundle) return this.startUpdate(bundle);
+            return this.applyMismatchPolicy();
         }
+        this.finishRegistration();
+    }
 
+    applyMismatchPolicy() {
+        const { id, fw, hash } = this.info;
+        if (this.firmwareMismatch === 'refuse') {
+            return this.refuse('firmware mismatch',
+                `refusing ${id}: it runs firmware ${fw} (hash ${hash}) but this Pi deploys hash ${this.firmwareHash}. Plug the board into this Pi to update it`);
+        }
+        this.hooks.log('warn', `${id} runs firmware ${fw} (hash ${hash}), not the hash ${this.firmwareHash} this Pi deploys`);
+        this.finishRegistration();
+    }
+
+    finishRegistration() {
+        const { id, fw, hash } = this.info;
         this.name = this.hooks.register(id, { fw, hash });
         this.hooks.log('info', `${this.name} registered: serial ${id}, firmware ${fw}, hash ${hash}, authenticated`);
         this.sendJson(F.OPCODE.REGISTER_ACK, {

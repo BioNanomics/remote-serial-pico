@@ -20,13 +20,15 @@ const fs = require('fs');
 const net = require('net');
 
 // Operator command -> what it means. `board` commands are forwarded to the
-// Pico as a CONTROL_REQUEST; `listen` is served here.
+// Pico as a CONTROL_REQUEST; `listen` is served here; `server` commands are
+// answered by a function PtyServer supplies.
 const COMMANDS = Object.freeze({
     status: { board: 'status', timeoutMs: 5000 },
     reboot: { board: 'reboot', timeoutMs: 5000 },
     identify: { board: 'identify', timeoutMs: 5000 },
     uart_set: { board: 'uart_set', timeoutMs: 5000 },
     listen: { local: true },
+    update: { server: 'requestUpdate' },      // Phase F: answered by PtyServer, see there
 });
 
 const MAX_REQUEST = 4096;
@@ -106,6 +108,13 @@ class ControlServer {
         if (!spec) {
             log('warn', `${what} => refused: unknown command`);
             return this.reply(client, { ok: false, error: `unknown command: ${req.cmd}. Known: ${Object.keys(COMMANDS).join(', ')}` });
+        }
+        if (spec.server) {
+            // The server decides; the board need not be connected.
+            const fn = this.options[spec.server];
+            const answer = fn ? fn(req.pico) : { ok: false, error: `${req.cmd} is not available on this server` };
+            log(answer.ok ? 'info' : 'warn', `${what} => ${answer.ok ? `ok ${JSON.stringify(answer.result)}` : `refused: ${answer.error}`}`);
+            return this.reply(client, answer);
         }
         const session = sessionFor(req.pico);
         if (!session || !session.registered) {

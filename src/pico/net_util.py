@@ -142,7 +142,7 @@ def file_hash_prefix(path, length=16, chunk=512):
 FIRMWARE_MANIFEST = 'firmware.json'
 
 
-def firmware_hash(directory='', length=16, chunk=512):
+def firmware_hash(directory='', length=16, chunk=512, suffix=''):
     """First `length` hex characters of SHA-256 over the whole firmware, or
     'unknown'.
 
@@ -152,19 +152,25 @@ def firmware_hash(directory='', length=16, chunk=512):
     a change in net_util.py, frame.py or auth.py. The Pi computes the same
     value over its own copy (src/pi/runtime.js firmwareHash) and compares.
     Read in small chunks: no file is held whole in a Pico's 264 KB of RAM.
+
+    `suffix` hashes a staged update instead (each file read from
+    <name><suffix>, hashed under its real name), which is how an update is
+    checked as a whole before it replaces anything. Files under "usb_only" in
+    the manifest (boot.py) are deliberately not part of the hash: they are
+    never changed over the air.
     """
     try:
         import hashlib
         import binascii
         import json
         prefix = directory + '/' if directory else ''
-        with open(prefix + FIRMWARE_MANIFEST) as fh:
+        with open(prefix + FIRMWARE_MANIFEST + suffix) as fh:
             names = [FIRMWARE_MANIFEST] + list(json.load(fh)['files'])
         h = hashlib.sha256()
         for name in names:
             h.update(name.encode())
             h.update(b'\x00')
-            with open(prefix + name, 'rb') as fh:
+            with open(prefix + name + suffix, 'rb') as fh:
                 while True:
                     block = fh.read(chunk)
                     if not block:
@@ -200,6 +206,9 @@ class PicoLink:
       ('error', (code, msg))    the server reported an ERROR
       ('control', (id, cmd, args))  an authenticated control command to run;
                                 answer with control_response()
+      ('update_offer', obj)     an authenticated firmware offer (one file, or
+                                the final commit); only before registration
+      ('update_chunk', bytes)   4-byte offset + data for the file on offer
       ('ignored', opcode)       a later-phase opcode this firmware skips
       ('close', reason)         give up on this connection
 
@@ -262,6 +271,14 @@ class PicoLink:
             body['error'] = str(result)
         return self._json(frame.OP_CONTROL_RESPONSE, body)
 
+    def update_result(self, ok, msg, fw_hash=None):
+        """The one reply to a firmware update: accepted and about to restart,
+        or refused with the reason."""
+        body = {'ok': bool(ok), 'msg': str(msg)}
+        if fw_hash:
+            body['hash'] = fw_hash
+        return self._json(frame.OP_UPDATE_RESULT, body)
+
     def data_frames(self, data):
         """UART bytes as DATA frames, split so none exceeds MAX_PAYLOAD once
         its tag is added.
@@ -322,9 +339,13 @@ class PicoLink:
                     req.get('id') if isinstance(req, dict) else None, False, 'malformed control request')))
             else:
                 events.append(('control', (req.get('id'), req['cmd'], req.get('args'))))
+        elif op == frame.OP_UPDATE_OFFER:
+            # Never mid-operation: a blind may be moving. The Pi only offers
+            # an update at registration; anything else is turned down.
+            events.append(('send', self.update_result(False, 'updates are only accepted before registration')))
         elif op in frame.KNOWN_OPCODES:
-            # Assigned to a later phase (update), or a handshake opcode out
-            # of place: nothing to do, and not an error.
+            # A handshake or update opcode out of place: nothing to do, and
+            # not an error.
             events.append(('ignored', op))
         else:
             events.append(('send', self.error_frame(
@@ -371,6 +392,21 @@ class PicoLink:
             self.name = ack.get('name')
             self.server_time = ack.get('time')
             events.append(('registered', self.name))
+        elif op == frame.OP_UPDATE_OFFER or op == frame.OP_UPDATE_CHUNK:
+            # Firmware is accepted only from a server that has proved it holds
+            # our key: the tag must verify, exactly as for REGISTER_ACK.
+            body = self._rx.open(op, payload) if self._rx is not None else None
+            if body is None:
+                events.append(('close', 'firmware update from a server that did not prove it holds the device key'))
+                return True
+            if op == frame.OP_UPDATE_CHUNK:
+                events.append(('update_chunk', body))
+            else:
+                offer = frame.decode_json(body)
+                if not isinstance(offer, dict):
+                    events.append(('send', self.update_result(False, 'UPDATE_OFFER is not a JSON object')))
+                else:
+                    events.append(('update_offer', offer))
         elif op == frame.OP_ERROR:
             err = frame.decode_json(payload) or {}
             events.append(('error', (err.get('code'), err.get('msg'))))

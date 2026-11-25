@@ -68,9 +68,9 @@ opaque.
 | `0x21` | `AUTH_RESPONSE` | Pico → Pi | bytes: 32-byte Pico nonce + 32-byte HMAC-SHA256 proof | D |
 | `0x30` | `CONTROL_REQUEST` | Pi → Pico | JSON `{"id": int, "cmd": str, "args": {...}}` | E |
 | `0x31` | `CONTROL_RESPONSE` | Pico → Pi | JSON `{"id": int, "ok": bool, "result": {...}}` or `{"id": int, "ok": false, "error": str}` | E |
-| `0x40` | `UPDATE_OFFER` | Pi → Pico | JSON `{"len": int, "sha256": hex}` | F |
-| `0x41` | `UPDATE_CHUNK` | Pi → Pico | bytes: 4-byte BE offset + data | F |
-| `0x42` | `UPDATE_RESULT` | Pico → Pi | JSON `{"ok": bool, "msg": str}` | F |
+| `0x40` | `UPDATE_OFFER` | Pi → Pico | JSON: one file `{"name": str, "len": int, "sha256": hex}`, or the commit `{"commit": true, "hash": str, "files": [str]}` | F |
+| `0x41` | `UPDATE_CHUNK` | Pi → Pico | bytes: 4-byte BE offset + data, for the file on offer | F |
+| `0x42` | `UPDATE_RESULT` | Pico → Pi | JSON `{"ok": bool, "msg": str}`, plus `"hash"` when ok | F |
 | `0x50`–`0x5F` | reserved | | encryption negotiation, do not assign | G |
 
 Codes not in this table are invalid. A receiver that sees one replies `ERROR`
@@ -124,8 +124,8 @@ deploy, the board is refused (`REGISTER_ACK` with `ok` false, reason
 `firmware mismatch`) and stays refused until it is plugged into the Pi again,
 which redeploys it. `FirmwareMismatch: warn` in `config.yaml` serves it and
 logs a warning instead. The check happens after authentication, so only a
-genuine board can be told anything about firmware. Phase F will replace the
-refusal with an update.
+genuine board can be told anything about firmware. With firmware updates
+turned on, the board is updated instead (see "Firmware update").
 
 A protocol version mismatch is always refused: see "Version mismatch" under
 "Framing rules".
@@ -310,10 +310,111 @@ command and its result is logged. `listen` is served by `PtyServer` itself: it
 copies the board's `DATA` traffic, hex-encoded, to the client until it
 disconnects, and sends nothing to the board.
 
-`update` (Phase F) and `rotate-key` are named in the issue's command list and
-are not part of this revision. A key should not be sent over a link that is
-authenticated but not encrypted, so `rotate-key` waits for Phase G; until
-then a key is rotated by plugging the board into the Pi.
+`remote-serial-pico ctl <name> update` is answered by `PtyServer`, not the
+board: it allows that one board to be updated the next time it registers and,
+if it is connected, makes it reconnect now (see "Firmware update").
+
+`rotate-key` is named in the issue's command list and is not part of this
+revision. A key should not be sent over a link that is authenticated but not
+encrypted, so it waits for Phase G; until then a key is rotated by plugging
+the board into the Pi.
+
+## Firmware update
+
+A board whose firmware `hash` differs from the Pi's can be brought up to date
+over the air. The rules that keep this from being the most dangerous feature
+in the project:
+
+* **Only at registration.** The Pi offers an update after the board has
+  authenticated and *instead of* `REGISTER_ACK`. The board is not registered,
+  has no pty, and has relayed no serial data, so nothing is interrupted. A
+  registered board answers any `UPDATE_OFFER` with `UPDATE_RESULT` `ok` false:
+  never mid-operation, a blind may be moving.
+* **Only from the holder of the key.** Every `UPDATE_OFFER` and
+  `UPDATE_CHUNK` carries the session's authentication tag, exactly as
+  `REGISTER_ACK` does. A board that gets one without a valid tag closes the
+  connection and writes nothing.
+* **Opt-in, one board at a time.** Nothing is offered unless `FirmwareUpdate`
+  is true in `config.yaml` or an operator ran
+  `remote-serial-pico ctl <name> update` for that board. While one board is
+  being updated, others that need it are refused with `firmware mismatch` and
+  come back 30 s later. A board is offered the same update at most twice per
+  server run.
+* **Verified before anything is replaced; reverted if it does not start.**
+
+### Transfer
+
+```
+Pico                                            Pi
+  REGISTER, AUTH_CHALLENGE, AUTH_RESPONSE   as always
+                                     <-----    UPDATE_OFFER {name, len, sha256}      for each file
+                                     <-----    UPDATE_CHUNK offset || data ...        512 data bytes each
+                                     <-----    UPDATE_OFFER {commit, hash, files}
+  verifies everything
+  UPDATE_RESULT {ok, msg, hash}      ----->
+  ok: swaps the files in, resets                closes; logs old -> new
+  not ok: discards what it staged               logs; the mismatch policy applies
+```
+
+The files are the ones `firmware.json` lists, plus `firmware.json` itself,
+which is always sent first. `sha256` is the full 64-character SHA-256 of the
+file; `hash` in the commit is the firmware hash (see `REGISTER`) the board
+will report once it runs them.
+
+The Pico writes each file to `<name>.new`. It refuses, and replies
+`UPDATE_RESULT` `ok` false with the reason, if:
+
+* a name is not a plain `*.py` file or `firmware.json` in the board's root
+  directory, or is `boot.py`, `config.json` or `update.json`;
+* a chunk's offset is not the number of bytes received so far, or a file
+  gets more or fewer bytes than its `len`;
+* a file's SHA-256, read back from flash, is not the one announced;
+* the files received are not exactly the commit's `files`, or not exactly
+  the ones the new `firmware.json` lists;
+* the firmware hash of the staged files is not the commit's `hash`.
+
+A refusal deletes everything staged. The board keeps running what it had and
+stays connected; the Pi then treats it as any other mismatched board
+(`FirmwareMismatch`: refused, or served with a warning).
+
+### Swap, trial and rollback
+
+Only after replying `ok` does the board change anything live:
+
+1. It writes `update.json` (`{"files": [...], "boots": 0}`).
+2. For each file it renames the running one to `<name>.bak` and `<name>.new`
+   into place.
+3. It resets.
+
+`boot.py` runs before `main.py` on every start. It is deliberately small,
+imports nothing from the rest of the firmware, is **not** part of the
+firmware hash and is **never** sent in an update: only plugging the board
+into the Pi replaces it. So an update can break `main.py` and everything it
+imports, but not the code that recovers from that.
+
+While `update.json` lists files, `boot.py` counts the start and arms the
+watchdog (8388 ms) *before* `main.py` gets control. New firmware that fails to
+import, crashes to the REPL or hangs therefore still ends in a reset. When
+the new firmware has registered with the Pi (an authenticated `REGISTER_ACK`
+with `ok` true), `main.py` deletes `update.json` and the `.bak` files: the
+trial is over. If three starts go by without that, the fourth start renames
+every `.bak` back and deletes `update.json`, and the board is on its previous
+firmware again, able to receive another update.
+
+A power cut during step 2 leaves a mix of old and new files and a marker;
+the same three-starts rule restores the old set.
+
+A fresh USB deploy copies an empty `update.json` (`"files": []`) along with
+the firmware, so leftovers from an earlier update can never roll a
+just-deployed board back.
+
+This differs from the issue's sketch, which put the *updater* in `boot.py`.
+Here `boot.py` holds only the rollback, and the code that receives an update
+lives in `update.py`, which is itself updatable. The property the issue asked
+for is kept: one bad push cannot leave a board that needs a USB visit, because
+the board returns to firmware that could receive updates. What is not
+covered: an update whose firmware starts and registers but whose update code
+is broken can only be replaced over USB.
 
 ## Sequence numbers
 
@@ -350,6 +451,8 @@ with `ERROR` code 1. The responder then closes.
 TCP connect
   -> send REGISTER
   <- AUTH_CHALLENGE                answer with AUTH_RESPONSE, derive session keys
+  <- UPDATE_OFFER/CHUNK + tag      (only if the Pi is updating this board)
+                                   stage, verify, UPDATE_RESULT; ok: swap, reset
   <- REGISTER_ACK ok=true + tag    refused, or ok=true without a valid tag:
                                    log reason, close, back off
   loop (every frame tagged; a bad tag closes the connection):
@@ -357,7 +460,7 @@ TCP connect
      DATA received            -> write payload to UART
      every 10 s               -> send PING, expect PONG
      CONTROL_REQUEST received -> act, send CONTROL_RESPONSE
-     UPDATE_* received        -> stage, verify, reply         (Phase F)
+     UPDATE_OFFER received    -> refuse: updates happen only before registration
      anything else            -> ERROR code 2, keep going
 ```
 
@@ -404,6 +507,8 @@ frame.
 | Cross-check | both | `src/pi/interop.test.js`: frames encoded in JS and decoded in Python; proof, session keys, frame tags and firmware hash computed on both sides and compared, under CPython and MicroPython |
 | Control commands (board) | `src/pico/control.py` | `src/pico/test_control.py` |
 | Control socket and CLI (Pi) | `src/pi/control.js`, `src/pi/ctl.js` | `src/pi/control.test.js` |
+| Firmware update (board) | `src/pico/update.py`, `src/pico/boot.py` | `src/pico/test_update.py` |
+| Firmware update (Pi) | `src/pi/session.js`, `src/pi/runtime.js` (`firmwareBundle`), `src/pi/PtyServer.js` (gating) | `src/pi/session.test.js`, `src/pi/firmware.sim.test.js` (update, rejection and rollback against the real firmware) |
 | Key provisioning | `src/pi/PicoScriptDeployer.py` | `src/pi/test_PicoScriptDeployer.py` |
 | Key store, firmware hash | `src/pi/runtime.js` | `src/pi/runtime.test.js` |
 | Server | `src/pi/PtyServer.js` | `src/pi/session.test.js` (the protocol logic lives in `session.js`) |

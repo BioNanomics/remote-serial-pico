@@ -89,6 +89,7 @@ remote-serial-pico ctl Blinds_pico reboot
 remote-serial-pico ctl Blinds_pico uart set 9600       # retune the serial link: baud [bits parity stop]
 remote-serial-pico ctl Blinds_pico uart set 9600 8 N 1 --save
 remote-serial-pico ctl Blinds_pico listen              # watch the serial traffic in hex, Ctrl-C to stop
+remote-serial-pico ctl Blinds_pico update              # bring its firmware up to date (see below)
 ```
 
 The name is the port name shown by `remote-serial-pico status`. These commands
@@ -102,6 +103,36 @@ across restarts, so check it works first.
 
 Anyone who may open the ports (members of the `rspico` group) may use `ctl`.
 Every command and its result is written to the server log.
+
+### Updating board firmware over the air
+
+When the firmware in this package changes, boards still run the old one. By
+default such a board is refused until you plug it into the Pi again. Instead,
+the Pi can send it the new firmware over WiFi:
+
+```bash
+remote-serial-pico ctl Blinds_pico update     # this one board, now
+```
+
+Do that for **one board first** and check it comes back in
+`remote-serial-pico status` on the new firmware. To let every board update
+itself the next time it connects, one at a time, set `FirmwareUpdate: true`
+in `config.yaml` and restart the service.
+
+What makes this safe to use:
+
+* A board is only updated when it connects, before it relays anything, never
+  in the middle of an operation.
+* It only accepts firmware from the Pi it was provisioned on.
+* It checks every file it received before replacing anything. A cut-off or
+  corrupted update is thrown away and the board carries on as it was.
+* It keeps its previous firmware. If the new one does not start and register
+  with the Pi within three attempts, the board goes back to the previous one
+  by itself.
+
+The server log shows each update with the old and the new firmware hash.
+A board that was never plugged into this Pi cannot be updated this way; it
+has no key yet.
 
 ### Where everything lives
 
@@ -157,6 +188,7 @@ service after editing it: `sudo systemctl restart ptyserver.service`.
 | `CustomlogDir` | Plain-text application log |
 | `TCP_PORT` | Port the Picos connect to. The deployer writes it into each board's `config.json`, so change it here and re-plug the boards |
 | `BindAddress` | Where the server listens, and the address each Pico is told to connect to. An interface name (`wlan0`) is resolved each time the service starts; an IPv4 address pins it. `0.0.0.0` listens everywhere, which `doctor` reports as a problem |
+| `FirmwareUpdate` | `false` (default): no board is updated unless you run `ctl <name> update` for it. `true`: any board on other firmware is updated when it connects, one at a time |
 | `FirmwareMismatch` | What to do with a board whose firmware is not what this Pi would deploy: `refuse` (default) turns it away until it is plugged into the Pi again, `warn` serves it and logs. See [docs/protocol.md](./docs/protocol.md) |
 
 ### Install options
@@ -313,7 +345,8 @@ Start with `remote-serial-pico doctor`: it checks each of these and prints the f
 | Nothing in `deployer.log` on plug-in | A board in BOOTSEL/mass-storage mode is not `2e8a:0005`; turn on auto-flash (Part 2, step 1) or flash MicroPython by hand |
 | Log says `refusing <id>: no device key on record` | The board was never plugged into this Pi (or its key was lost). Plug it in |
 | Log says `refusing <id>: it does not hold the device key` | The board's key and the Pi's differ, or something is impersonating the board. Plug the real board in to re-key it |
-| Log says `refusing <id>: it runs firmware ...` | The board's firmware is not what this Pi deploys. Plug it in, or set `FirmwareMismatch: warn` |
+| Log says `refusing <id>: it runs firmware ...` | The board's firmware is not what this Pi deploys. Run `remote-serial-pico ctl <name> update`, or plug it in, or set `FirmwareMismatch: warn` |
+| Log says `firmware update: <id> did NOT take the update` | The reason follows in the same line. The board is still on its old firmware and still works with `FirmwareMismatch: warn`; plug it in to update it over USB |
 | Deployer runs but Pico never connects | Wrong SSID/password captured, the Pi's address changed since the board was provisioned, or client isolation on the WiFi. Plug the board into the Pi again to re-provision it |
 | Pico LED blinks forever | Cannot join WiFi — plug it into the Pi again |
 | `cannot open .../ports/<name>` | The Pico is not currently connected, so there is no live pty behind that symlink |

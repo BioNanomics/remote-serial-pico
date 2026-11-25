@@ -128,7 +128,8 @@ test('parseArgs reads the command and options, and reports what it does not unde
 test('config.yaml is generated from the committed example with the root and bind filled in', () => {
     const d = tmp(); const ctx = ctxIn(d);
     const y = I.parseFlatYaml(I.renderConfig(ctx, 'wlan0'));
-    assert.deepStrictEqual(Object.keys(y).sort(), [...I.CONFIG_KEYS, 'FirmwareMismatch'].sort());
+    assert.deepStrictEqual(Object.keys(y).sort(), [...I.CONFIG_KEYS, 'FirmwareMismatch', 'FirmwareUpdate'].sort());
+    assert.strictEqual(y.FirmwareUpdate, 'false', 'over-the-air updates are opt-in');
     assert.strictEqual(y.FirmwareMismatch, 'refuse');
     assert.ok(!('AcceptLegacyPicos' in y), 'there is no legacy mode to configure');
     const root = ctx.cfg.root;

@@ -9,6 +9,7 @@ import machine
 from machine import UART, Pin, WDT
 import auth
 import control
+import update
 from net_util import (safe_decode, send_all, firmware_hash, Backoff,
                       HeartbeatMonitor, PicoLink, RegistrationRefused)
 
@@ -17,7 +18,7 @@ from net_util import (safe_decode, send_all, firmware_hash, Backoff,
 # `remote-serial-pico status` and the logs can say which firmware each board
 # runs without anyone walking over to it. Bump on every change that ships to
 # a board.
-FIRMWARE_VERSION = '1.2.0'
+FIRMWARE_VERSION = '1.3.0'
 FIRMWARE_HASH = firmware_hash()
 
 # Load network configuration
@@ -232,6 +233,28 @@ class Board:
 board = Board()
 controller = control.ControlHandler(board, UART_SETTINGS)
 
+# Firmware updates (issue #19 Phase F). The Pi offers one only at
+# registration, before any serial data is relayed; update.py stages and
+# verifies it, and boot.py restores the previous firmware if the new one never
+# registers. Anything half-received by an earlier attempt is thrown away here.
+UPDATE_TIMEOUT = 90       # seconds the whole transfer may take
+update.cleanup_staged()
+receiver = None           # update.Receiver while an update is being received
+update_refused = False    # this connection's update was turned down; ignore the rest of it
+
+def update_failed(sock, reason):
+    """Refuse the update, keep running what we have, and say why."""
+    global receiver, update_refused
+    if receiver is not None:
+        receiver.abort()
+        receiver = None
+    # The Pi sends the whole update without waiting, so more files are already
+    # on their way. They belong to the update just refused: without this they
+    # would start a second, partial one and leave its files behind.
+    update_refused = True
+    print(f"[OTA] Update rejected: {reason}. Still running {FIRMWARE_VERSION} ({FIRMWARE_HASH})")
+    tcp_send(sock, link.update_result(False, reason))
+
 def tcp_send(sock, data):
     """Send all of data. Fed first, so a full SOCKET_TIMEOUT stall in here can
     never combine with another wait in the same pass to outlast the watchdog."""
@@ -240,6 +263,7 @@ def tcp_send(sock, data):
 
 def handle_server_event(sock, heartbeat, kind, value):
     """Act on one event from PicoLink.receive(). Only 'data' touches the UART."""
+    global receiver, register_deadline, update_refused
     if kind == 'data':
         uart1.write(value)
         stats['uart_tx_bytes'] += len(value)
@@ -261,7 +285,45 @@ def handle_server_event(sock, heartbeat, kind, value):
         print("[TCP] Heartbeat response: PONG")
     elif kind == 'send':
         tcp_send(sock, value)
+    elif kind in ('update_offer', 'update_chunk') and update_refused:
+        pass                      # the tail of an update already turned down
+    elif kind == 'update_offer':
+        register_deadline = time.time() + UPDATE_TIMEOUT
+        try:
+            if value.get('commit'):
+                if receiver is None:
+                    raise update.UpdateError('commit with nothing staged')
+                new_hash = receiver.commit(value, lambda suffix: firmware_hash(suffix=suffix))
+                # Verified, every file. Only now does anything get replaced.
+                tcp_send(sock, link.update_result(True, 'verified; restarting', new_hash))
+                print(f"[OTA] Update verified: {FIRMWARE_HASH} -> {new_hash}. Installing and restarting")
+                receiver.apply()
+                time.sleep(0.3)   # let the reply leave the socket
+                machine.reset()
+            else:
+                if receiver is None:
+                    print(f"[OTA] The Pi is offering new firmware (running {FIRMWARE_VERSION}, {FIRMWARE_HASH})")
+                    receiver = update.Receiver()
+                receiver.offer(value)
+        except update.UpdateError as e:
+            update_failed(sock, str(e))
+        except OSError as e:
+            update_failed(sock, f'could not store the update: {e}')
+    elif kind == 'update_chunk':
+        try:
+            if receiver is None:
+                raise update.UpdateError('chunk with no update on offer')
+            receiver.chunk(value)
+        except update.UpdateError as e:
+            update_failed(sock, str(e))
+        except OSError as e:
+            update_failed(sock, f'could not store the update: {e}')
     elif kind == 'registered':
+        if receiver is not None:  # registered without finishing an update: drop what was staged
+            receiver.abort()
+            receiver = None
+        if update.confirm():
+            print("[OTA] New firmware confirmed: it registered with the Pi")
         print(f"[TCP] Registered as '{value}' (fw {FIRMWARE_VERSION}, hash {FIRMWARE_HASH}); the Pi proved it holds our key")
     elif kind == 'refused':
         raise RegistrationRefused(f'registration refused: {value}')
@@ -286,6 +348,10 @@ while True:
     link = PicoLink(PICO_ID, FIRMWARE_VERSION, FIRMWARE_HASH, DEVICE_KEY)
     stats['connections'] += 1
     identify_tick = 0
+    if receiver is not None:        # an update cut off by a lost connection
+        receiver.abort()
+        receiver = None
+    update_refused = False
     heartbeat = HeartbeatMonitor(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
                                  HEARTBEAT_MAX_MISSES, now=time.time())
     extra_delay = 0

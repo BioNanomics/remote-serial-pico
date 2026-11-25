@@ -222,6 +222,129 @@ test('an unauthenticated peer cannot use a firmware mismatch to learn anything o
     assert.deepStrictEqual(out.sent.map(f => f.opcode), [F.OPCODE.AUTH_CHALLENGE], 'firmware is judged only after authentication');
 });
 
+// --- firmware update at registration (Phase F) -----------------------------------------
+
+const BUNDLE = {
+    hash: 'bbbbbbbbbbbbbbbb',
+    files: [
+        { name: 'firmware.json', data: Buffer.from('{"files": ["main.py"]}'), sha256: 'f'.repeat(64) },
+        { name: 'main.py', data: Buffer.alloc(1300, 0x41), sha256: 'e'.repeat(64) },
+    ],
+};
+
+function updating(overrides = {}, options = {}) {
+    const events = [];
+    const h = harness({
+        offerUpdate: (id, info) => { events.push(['offer', id, info]); return BUNDLE; },
+        updateFinished: (id, ok, detail) => events.push(['finished', id, ok, detail]),
+        ...overrides,
+    }, { firmwareHash: BUNDLE.hash, ...options });
+    const pico = new FakePico(h.session, h.out);
+    pico.register();
+    pico.respond();
+    return { ...h, pico, events };
+}
+
+test('a board on other firmware is sent the update before it is registered: no pty, no serial data', () => {
+    const { session, out, pico, events } = updating();
+    assert.deepStrictEqual(events, [['offer', REG.id, { fw: REG.fw, hash: REG.hash }]]);
+    assert.strictEqual(session.registered, false);
+    assert.deepStrictEqual(out.registered, [], 'updates happen before any serial data can be relayed');
+    session.sendData(Buffer.from('#255.19.255.B=UP\r'));
+    assert.ok(out.sent.every(f => f.opcode !== F.OPCODE.DATA), 'a command for the device is not sent into an update');
+
+    const frames = out.sent.slice(1).map(f => ({ opcode: f.opcode, body: pico.open(f) }));   // every one is tagged
+    assert.deepStrictEqual(frames.map(f => f.opcode), [
+        F.OPCODE.UPDATE_OFFER, F.OPCODE.UPDATE_CHUNK,
+        F.OPCODE.UPDATE_OFFER, F.OPCODE.UPDATE_CHUNK, F.OPCODE.UPDATE_CHUNK, F.OPCODE.UPDATE_CHUNK,
+        F.OPCODE.UPDATE_OFFER,
+    ]);
+    assert.deepStrictEqual(JSON.parse(frames[0].body), { name: 'firmware.json', len: 22, sha256: 'f'.repeat(64) });
+    assert.deepStrictEqual(JSON.parse(frames[2].body), { name: 'main.py', len: 1300, sha256: 'e'.repeat(64) });
+    assert.deepStrictEqual(frames.slice(3, 6).map(f => [f.body.readUInt32BE(0), f.body.length - 4]), [[0, 512], [512, 512], [1024, 276]]);
+    assert.deepStrictEqual(JSON.parse(frames[6].body), { commit: true, hash: BUNDLE.hash, files: ['firmware.json', 'main.py'] });
+    assert.ok(out.log.some(l => /firmware update: e6614103e71d2c2f runs 1\.1\.0 \(hash 3b0c44298fc1c149\); sending hash bbbbbbbbbbbbbbbb, 2 files, 1322 bytes/.test(l)));
+});
+
+test('the board accepting the update is logged with old and new versions, and the connection ends', () => {
+    const { session, out, pico, events } = updating();
+    out.sent.slice(1).forEach(f => pico.open(f));
+    pico.send(F.OPCODE.UPDATE_RESULT, JSON.stringify({ ok: true, msg: 'verified; restarting', hash: BUNDLE.hash }));
+    assert.match(out.log.at(-1), /info: firmware update: e6614103e71d2c2f verified and installed it: 1\.1\.0 \(hash 3b0c44298fc1c149\) -> hash bbbbbbbbbbbbbbbb\. The board is restarting/);
+    assert.deepStrictEqual(events.at(-1), ['finished', REG.id, true, { from: REG.hash, to: BUNDLE.hash }]);
+    assert.strictEqual(out.closed, true);
+    assert.deepStrictEqual(out.registered, []);
+    assert.strictEqual(session.updating, null);
+});
+
+test('a rejected update is logged, the board keeps its firmware, and the mismatch policy applies', () => {
+    let r = updating();
+    r.out.sent.slice(1).forEach(f => r.pico.open(f));
+    r.pico.send(F.OPCODE.UPDATE_RESULT, JSON.stringify({ ok: false, msg: 'main.py: sha256 does not match' }));
+    assert.ok(r.out.log.some(l => /error: firmware update: e6614103e71d2c2f did NOT take the update \(main\.py: sha256 does not match\); it keeps running hash 3b0c44298fc1c149/.test(l)));
+    assert.deepStrictEqual(r.events.at(-1), ['finished', REG.id, false, 'main.py: sha256 does not match']);
+    assert.deepStrictEqual(JSON.parse(r.pico.open(r.out.sent.at(-1))), { ok: false, reason: 'firmware mismatch' });
+    assert.strictEqual(r.out.closed, true);
+
+    r = updating({}, { firmwareMismatch: 'warn' });
+    r.out.sent.slice(1).forEach(f => r.pico.open(f));
+    r.pico.send(F.OPCODE.UPDATE_RESULT, JSON.stringify({ ok: false, msg: 'flash full' }));
+    assert.ok(r.session.registered, 'with warn, a board that could not update is still served on what it has');
+    assert.deepStrictEqual(r.out.registered, [REG]);
+});
+
+test('a board that claims success with the wrong hash has not been updated', () => {
+    const { out, pico, events } = updating();
+    out.sent.slice(1).forEach(f => pico.open(f));
+    pico.send(F.OPCODE.UPDATE_RESULT, JSON.stringify({ ok: true, msg: 'ok', hash: 'cccccccccccccccc' }));
+    assert.strictEqual(events.at(-1)[2], false);
+    assert.ok(out.log.some(l => /did NOT take the update \(the board reports hash cccccccccccccccc, not bbbbbbbbbbbbbbbb\)/.test(l)));
+});
+
+test('an update that gets no answer, or loses its connection, is finished as failed', async () => {
+    let r = updating({}, { updateTimeoutMs: 20 });
+    await new Promise((res) => setTimeout(res, 60));
+    assert.strictEqual(r.events.at(-1)[2], false);
+    assert.match(r.events.at(-1)[3], /no answer from the board within 0\.02 s/);
+    assert.strictEqual(r.session.updating, null);
+
+    r = updating();
+    r.session.connectionLost();
+    assert.deepStrictEqual(r.events.at(-1), ['finished', REG.id, false, 'the connection was lost during the update']);
+    r.session.connectionLost();
+    assert.strictEqual(r.events.filter(e => e[0] === 'finished').length, 1, 'reported once');
+});
+
+test('no update is offered to a board that already runs this firmware, or when the server declines', () => {
+    let asked = 0;
+    let r = registered({ offerUpdate: () => { asked++; return BUNDLE; } }, { firmwareHash: REG.hash });
+    assert.strictEqual(asked, 0);
+    assert.ok(r.out.sent.every(f => f.opcode !== F.OPCODE.UPDATE_OFFER));
+
+    const h = harness({ offerUpdate: () => null }, { firmwareHash: BUNDLE.hash });      // updates off, or another board is in progress
+    const pico = new FakePico(h.session, h.out);
+    pico.register();
+    pico.respond();
+    assert.deepStrictEqual(JSON.parse(pico.open(h.out.sent.at(-1))), { ok: false, reason: 'firmware mismatch' });
+});
+
+test('nothing about an update is sent to a peer that has not authenticated', () => {
+    let asked = 0;
+    const { session, out } = harness({ offerUpdate: () => { asked++; return BUNDLE; } }, { firmwareHash: BUNDLE.hash });
+    const attacker = new FakePico(session, out);
+    attacker.register();
+    attacker.respond(crypto.randomBytes(32));
+    assert.strictEqual(asked, 0);
+    assert.ok(out.sent.every(f => f.opcode !== F.OPCODE.UPDATE_OFFER && f.opcode !== F.OPCODE.UPDATE_CHUNK));
+});
+
+test('an UPDATE_RESULT with no update in flight is ignored', () => {
+    const { out, pico } = registered();
+    pico.send(F.OPCODE.UPDATE_RESULT, JSON.stringify({ ok: true, hash: 'x' }));
+    assert.match(out.log.at(-1), /UPDATE_RESULT.*does not act on/);
+    assert.strictEqual(out.closed, false);
+});
+
 // --- after the handshake: every frame is authenticated ----------------------------
 
 test('DATA after registration reaches the pty byte for byte, terminator included', () => {

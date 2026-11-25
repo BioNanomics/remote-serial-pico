@@ -149,6 +149,24 @@ function firmwareFiles(picoDir, fsx = fs) {
     return ['firmware.json', ...JSON.parse(fsx.readFileSync(path.join(picoDir, 'firmware.json'), 'utf8')).files];
 }
 
+// Everything a board needs to become the firmware in `picoDir`: each file's
+// bytes and SHA-256, plus the hash the board will report afterwards. This is
+// what a firmware update sends (Phase F). boot.py is not in it: the manifest
+// lists it under "usb_only", because the recovery path is never replaced over
+// the air. Null if the firmware on disk is incomplete.
+function firmwareBundle(picoDir, fsx = fs) {
+    try {
+        const files = firmwareFiles(picoDir, fsx).map((name) => {
+            const data = fsx.readFileSync(path.join(picoDir, name));
+            return { name, data, sha256: crypto.createHash('sha256').update(data).digest('hex') };
+        });
+        const hash = firmwareHash(picoDir, fsx);
+        return hash ? { hash, files } : null;
+    } catch {
+        return null;
+    }
+}
+
 // The key store: one `<16 hex serial id>: <64 hex key>` per line, written by
 // the deployer. Parsed by hand, not as YAML: an all-digit serial id would
 // come back from a YAML parser as a number. Lines that are not exactly a
@@ -200,5 +218,5 @@ function sharePtyWithGroup(ptsName, fsx = fs, ids = { uid: process.getuid(), gid
 
 module.exports = {
     CONFIG_ENV, configPathFrom, isIPv4, ipv4Of, resolveBindAddress, networkOf, detectBindInterface,
-    StateFile, readState, clean, sharePtyWithGroup, firmwareHash, firmwareFiles, parseSecrets, SecretStore
+    StateFile, readState, clean, sharePtyWithGroup, firmwareHash, firmwareFiles, firmwareBundle, parseSecrets, SecretStore
 };
