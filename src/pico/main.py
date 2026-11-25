@@ -240,13 +240,18 @@ controller = control.ControlHandler(board, UART_SETTINGS)
 UPDATE_TIMEOUT = 90       # seconds the whole transfer may take
 update.cleanup_staged()
 receiver = None           # update.Receiver while an update is being received
+update_refused = False    # this connection's update was turned down; ignore the rest of it
 
 def update_failed(sock, reason):
     """Refuse the update, keep running what we have, and say why."""
-    global receiver
+    global receiver, update_refused
     if receiver is not None:
         receiver.abort()
         receiver = None
+    # The Pi sends the whole update without waiting, so more files are already
+    # on their way. They belong to the update just refused: without this they
+    # would start a second, partial one and leave its files behind.
+    update_refused = True
     print(f"[OTA] Update rejected: {reason}. Still running {FIRMWARE_VERSION} ({FIRMWARE_HASH})")
     tcp_send(sock, link.update_result(False, reason))
 
@@ -258,7 +263,7 @@ def tcp_send(sock, data):
 
 def handle_server_event(sock, heartbeat, kind, value):
     """Act on one event from PicoLink.receive(). Only 'data' touches the UART."""
-    global receiver, register_deadline
+    global receiver, register_deadline, update_refused
     if kind == 'data':
         uart1.write(value)
         stats['uart_tx_bytes'] += len(value)
@@ -280,6 +285,8 @@ def handle_server_event(sock, heartbeat, kind, value):
         print("[TCP] Heartbeat response: PONG")
     elif kind == 'send':
         tcp_send(sock, value)
+    elif kind in ('update_offer', 'update_chunk') and update_refused:
+        pass                      # the tail of an update already turned down
     elif kind == 'update_offer':
         register_deadline = time.time() + UPDATE_TIMEOUT
         try:
@@ -312,6 +319,9 @@ def handle_server_event(sock, heartbeat, kind, value):
         except OSError as e:
             update_failed(sock, f'could not store the update: {e}')
     elif kind == 'registered':
+        if receiver is not None:  # registered without finishing an update: drop what was staged
+            receiver.abort()
+            receiver = None
         if update.confirm():
             print("[OTA] New firmware confirmed: it registered with the Pi")
         print(f"[TCP] Registered as '{value}' (fw {FIRMWARE_VERSION}, hash {FIRMWARE_HASH}); the Pi proved it holds our key")
@@ -341,6 +351,7 @@ while True:
     if receiver is not None:        # an update cut off by a lost connection
         receiver.abort()
         receiver = None
+    update_refused = False
     heartbeat = HeartbeatMonitor(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
                                  HEARTBEAT_MAX_MISSES, now=time.time())
     extra_delay = 0

@@ -374,7 +374,10 @@ test('a corrupted update is rejected and the board keeps running the previous fi
     const oldHash = firmwareHash(old);
     const corrupt = () => {
         const bundle = firmwareBundle(PICO_SRC);
+        // Not the last file: the files after it are already on their way when
+        // the board refuses, and must not start a second, partial update.
         const victim = bundle.files.find((f) => f.name === 'net_util.py');
+        assert.ok(bundle.files.indexOf(victim) < bundle.files.length - 2);
         victim.data = Buffer.from(victim.data);
         victim.data[200] ^= 0x01;                       // one bit flipped after the hash was taken
         return bundle;
@@ -391,6 +394,8 @@ test('a corrupted update is rejected and the board keeps running the previous fi
     await waitFor(() => b.state.registrations.length === 1, 'the board to be served on what it has (warn policy)');
     assert.strictEqual(b.state.registrations[0].hash, oldHash);
     assert.ok(!boardFiles(b).some((n) => n.endsWith('.new') || n.endsWith('.bak')), `no half-update left: ${boardFiles(b)}`);
+    assert.strictEqual(b.state.stdout.filter((l) => /\[OTA\] (The Pi is offering|Update rejected)/.test(l)).length, 2,
+        'one offer, one refusal: the rest of the refused update is ignored');
     b.state.session.sendData(Buffer.from('#255.19.255.B=UP\r'));
     await waitFor(() => b.uartTx().length === 1, 'the old firmware to keep relaying');
 });
